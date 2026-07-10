@@ -9,8 +9,25 @@ import (
 	"github.com/VasuBhakt/vahak/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"go.uber.org/zap"
 )
+
+func runMigrations(dbUrl string, logger *zap.Logger) {
+	m, err := migrate.New("file://migrations", dbUrl)
+	if err != nil {
+		logger.Fatal("failed to init migrations", zap.Error(err))
+	}
+	defer m.Close()
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		logger.Fatal("failed to run migrations", zap.Error(err))
+	}
+
+	logger.Info("migrations applied successfully")
+}
 
 func main() {
 	// load config
@@ -30,6 +47,8 @@ func main() {
 	}
 	defer pool.Close()
 	logger.Info("connected to database")
+
+	runMigrations(cfg.DBUrl, logger)
 
 	// init chi router
 	r := chi.NewRouter()

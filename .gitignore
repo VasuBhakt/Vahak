@@ -1,1 +1,12 @@
+# env files - never push these, contains DB credentials and API key
 .env
+.env.local
+
+# Go build artifacts
+*.exe
+*.out
+/bin/
+
+# IDE
+.vscode/
+.idea/

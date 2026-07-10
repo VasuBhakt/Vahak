@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS delivery_jobs;
+DROP TABLE IF EXISTS requests;
+DROP TABLE IF EXISTS endpoints;
