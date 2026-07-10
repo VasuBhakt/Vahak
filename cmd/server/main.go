@@ -50,6 +50,10 @@ func main() {
 
 	runMigrations(cfg.DBUrl, logger)
 
+	// init store
+	st := store.New(pool)
+	_ = st // to be used
+
 	// init chi router
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
