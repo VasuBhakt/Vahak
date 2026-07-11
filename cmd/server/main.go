@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/VasuBhakt/vahak/config"
+	"github.com/VasuBhakt/vahak/internal/api"
 	"github.com/VasuBhakt/vahak/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -52,7 +53,20 @@ func main() {
 
 	// init store
 	st := store.New(pool)
-	_ = st // to be used
+
+	h := api.New(st, logger)
+
+	// middleware for protected routes
+	apiKeyMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			key := r.Header.Get("X-API-Key")
+			if key != cfg.APIKey {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 
 	// init chi router
 	r := chi.NewRouter()
@@ -63,6 +77,20 @@ func main() {
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
+	})
+
+	// public - webhook capture
+	r.Post("/hooks/{id}", h.CaptureWebhook)
+
+	// protected
+	r.Group(func(r chi.Router) {
+		r.Use(apiKeyMiddleware)
+		r.Post("/endpoints", h.CreateEndpoint)
+		r.Get("/endpoints", h.ListEndpoints)
+		r.Get("/endpoints/{id}", h.GetEndpoint)
+		r.Delete("/endpoints/{id}", h.DeleteEndpoint)
+		r.Get("/endpoints/{id}/requests", h.GetRequests)
+		r.Post("/endpoints/{id}/replay/{request_id}", h.ReplayRequest)
 	})
 
 	// start server
