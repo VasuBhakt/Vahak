@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/VasuBhakt/vahak/internal/models"
@@ -23,16 +24,16 @@ func New(pool *pgxpool.Pool) *Store {
 
 func (s *Store) CreateEndpoint(ctx context.Context, name, targetUrl string) (*models.Endpoint, error) {
 	e := &models.Endpoint{
-		ID:        uuid.New().String(),
+		ID:        uuid.New(),
 		Name:      name,
-		TargetUrl: targetUrl,
+		TargetURL: targetUrl,
 		CreatedAt: time.Now(),
 	}
 
 	_, err := s.db.Exec(ctx,
 		`INSERT INTO endpoints (id, name, target_url, created_at)
 		VALUES ($1, $2, $3, $4)`,
-		e.ID, e.Name, e.TargetUrl, e.CreatedAt,
+		e.ID, e.Name, e.TargetURL, e.CreatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("CreateEndpoint: %w", err)
@@ -45,7 +46,7 @@ func (s *Store) GetEndpoint(ctx context.Context, id uuid.UUID) (*models.Endpoint
 	err := s.db.QueryRow(ctx,
 		`SELECT id, name, target_url, created_at FROM endpoints WHERE id = $1`,
 		id,
-	).Scan(&e.ID, &e.Name, &e.TargetUrl, &e.CreatedAt)
+	).Scan(&e.ID, &e.Name, &e.TargetURL, &e.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("GetEndpoint: %w", err)
 	}
@@ -64,7 +65,7 @@ func (s *Store) ListEndpoints(ctx context.Context) ([]models.Endpoint, error) {
 	var endpoints []models.Endpoint
 	for rows.Next() {
 		var e models.Endpoint
-		if err := rows.Scan(&e.ID, &e.Name, &e.TargetUrl, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.Name, &e.TargetURL, &e.CreatedAt); err != nil {
 			return nil, fmt.Errorf("ListEndpoints scan: %w", err)
 		}
 		endpoints = append(endpoints, e)
@@ -89,14 +90,13 @@ func (s *Store) SaveRequest(ctx context.Context, r *models.Request) error {
 	}
 
 	_, err = s.db.Exec(ctx,
-		`INSERT INTO requests (id, endpoint_id, method, headers, body, source_ip, recieved_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		r.ID, r.EndpointID, r.Method, headersJSON, r.Body, r.SourceIP, r.ReceivedAt,
+		`INSERT INTO requests (id, endpoint_id, method, headers, body, source_ip, received_at)
+		 VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
+		r.ID, r.EndpointID, r.Method, string(headersJSON), r.Body, r.SourceIP, r.ReceivedAt,
 	)
 	if err != nil {
-		return fmt.Errorf("SaveRequest marshal: %w", err)
+		return fmt.Errorf("SaveRequest: %w", err)
 	}
-
 	return nil
 }
 
@@ -114,12 +114,14 @@ func (s *Store) GetRequestsByEndpoint(ctx context.Context, endpointID uuid.UUID)
 	for rows.Next() {
 		var r models.Request
 		var headersJSON []byte
+		var headers http.Header
 		if err := rows.Scan(&r.ID, &r.EndpointID, &r.Method, &headersJSON, &r.Body, &r.SourceIP, &r.ReceivedAt); err != nil {
 			return nil, fmt.Errorf("GetRequestsByEndpoint scan: %w", err)
 		}
-		if err := json.Unmarshal(headersJSON, &r.Headers); err != nil {
+		if err := json.Unmarshal(headersJSON, &headers); err != nil {
 			return nil, fmt.Errorf("GetRequestsByEndpoint unmarshal: %w", err)
 		}
+		r.Headers = headers
 		requests = append(requests, r)
 	}
 	return requests, nil
@@ -128,6 +130,7 @@ func (s *Store) GetRequestsByEndpoint(ctx context.Context, endpointID uuid.UUID)
 func (s *Store) GetRequest(ctx context.Context, id uuid.UUID) (*models.Request, error) {
 	var r models.Request
 	var headersJSON []byte
+	var headers http.Header
 	err := s.db.QueryRow(ctx,
 		`SELECT id, endpoint_id, method, headers, body, source_ip, received_at
 		 FROM requests WHERE id = $1`, id,
@@ -135,9 +138,10 @@ func (s *Store) GetRequest(ctx context.Context, id uuid.UUID) (*models.Request, 
 	if err != nil {
 		return nil, fmt.Errorf("GetRequest: %w", err)
 	}
-	if err := json.Unmarshal(headersJSON, &r.Headers); err != nil {
+	if err := json.Unmarshal(headersJSON, &headers); err != nil {
 		return nil, fmt.Errorf("GetRequest unmarshal: %w", err)
 	}
+	r.Headers = headers
 	return &r, nil
 }
 
@@ -145,8 +149,8 @@ func (s *Store) GetRequest(ctx context.Context, id uuid.UUID) (*models.Request, 
 
 func (s *Store) CreateDeliveryJob(ctx context.Context, requestID uuid.UUID, targetURL string) (*models.DeliveryJob, error) {
 	job := &models.DeliveryJob{
-		ID:          uuid.New().String(),
-		RequestID:   requestID.String(),
+		ID:          uuid.New(),
+		RequestID:   requestID,
 		TargetURL:   targetURL,
 		Status:      "pending",
 		Attempts:    0,

@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS requests (
     headers     JSONB NOT NULL,
     body    TEXT,
     source_ip   VARCHAR(50),
-    recieved_at     TIMESTAMPTZ DEFAULT NOW()   
+    received_at     TIMESTAMPTZ DEFAULT NOW()   
 );
 
 CREATE TABLE IF NOT EXISTS delivery_jobs (
