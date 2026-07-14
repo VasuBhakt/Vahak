@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/VasuBhakt/vahak/config"
 	"github.com/VasuBhakt/vahak/internal/api"
+	"github.com/VasuBhakt/vahak/internal/forwarder"
 	"github.com/VasuBhakt/vahak/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -93,11 +99,40 @@ func main() {
 		r.Post("/endpoints/{id}/replay/{request_id}", h.ReplayRequest)
 	})
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// start forwarder
+	fwd := forwarder.New(st, logger)
+	fwd.Start(ctx)
+
+	// graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+
 	// start server
 	addr := fmt.Sprintf(":%s", cfg.Port)
-	logger.Info("starting server", zap.String("addr", addr))
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: r,
+	}
 
-	if err := http.ListenAndServe(addr, r); err != nil {
+	go func() {
+		<-quit
+		logger.Info("shutting down")
+		cancel()
+
+		// Create a timeout context for the server shutdown
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Error("server shutdown failed", zap.Error(err))
+		}
+	}()
+
+	logger.Info("starting server", zap.String("addr", addr))
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Fatal("server failed", zap.Error(err))
 	}
 }
