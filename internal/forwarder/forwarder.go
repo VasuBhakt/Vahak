@@ -9,6 +9,7 @@ import (
 
 	"github.com/VasuBhakt/vahak/internal/models"
 	"github.com/VasuBhakt/vahak/internal/store"
+	"github.com/VasuBhakt/vahak/internal/transformer"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -77,6 +78,26 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 		return
 	}
 
+	endpoint, err := f.store.GetEndpoint(ctx, req.EndpointID)
+	if err != nil {
+		f.logger.Error("failed to get endpoint for job",
+			zap.String("job_id", job.ID.String()),
+			zap.Error(err),
+		)
+		return
+	}
+
+	finalBody := req.Body
+	if endpoint.TransformerScript != "" {
+		transformed, err := transformer.Transform(endpoint.TransformerScript, req.Body)
+		if err != nil {
+			f.logger.Error("transformation failed", zap.Error(err))
+			return
+		} else {
+			finalBody = transformed
+		}
+	}
+	req.Body = finalBody
 	// attempt delivery
 	err = f.deliver(job.TargetURL, req)
 	attempts := job.Attempts + 1
@@ -127,6 +148,10 @@ func (f *Forwarder) deliver(targetURL string, req *models.Request) error {
 
 	// forward original headers
 	for key, values := range req.Headers {
+		// skip content-length because the transformed body might have a different size
+		if key == "Content-Length" {
+			continue
+		}
 		for _, v := range values {
 			httpReq.Header.Add(key, v)
 		}

@@ -22,18 +22,19 @@ func New(pool *pgxpool.Pool) *Store {
 
 // Endpoints
 
-func (s *Store) CreateEndpoint(ctx context.Context, name, targetUrl string) (*models.Endpoint, error) {
+func (s *Store) CreateEndpoint(ctx context.Context, name, targetUrl string, transfomer string) (*models.Endpoint, error) {
 	e := &models.Endpoint{
-		ID:        uuid.New(),
-		Name:      name,
-		TargetURL: targetUrl,
-		CreatedAt: time.Now(),
+		ID:                uuid.New(),
+		Name:              name,
+		TargetURL:         targetUrl,
+		CreatedAt:         time.Now(),
+		TransformerScript: transfomer,
 	}
 
 	_, err := s.db.Exec(ctx,
-		`INSERT INTO endpoints (id, name, target_url, created_at)
-		VALUES ($1, $2, $3, $4)`,
-		e.ID, e.Name, e.TargetURL, e.CreatedAt,
+		`INSERT INTO endpoints (id, name, target_url, transformer_script, created_at)
+		VALUES ($1, $2, $3, $4, $5)`,
+		e.ID, e.Name, e.TargetURL, e.TransformerScript, e.CreatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("CreateEndpoint: %w", err)
@@ -44,9 +45,9 @@ func (s *Store) CreateEndpoint(ctx context.Context, name, targetUrl string) (*mo
 func (s *Store) GetEndpoint(ctx context.Context, id uuid.UUID) (*models.Endpoint, error) {
 	e := &models.Endpoint{}
 	err := s.db.QueryRow(ctx,
-		`SELECT id, name, target_url, created_at FROM endpoints WHERE id = $1`,
+		`SELECT id, name, target_url, transformer_script, created_at FROM endpoints WHERE id = $1`,
 		id,
-	).Scan(&e.ID, &e.Name, &e.TargetURL, &e.CreatedAt)
+	).Scan(&e.ID, &e.Name, &e.TargetURL, &e.TransformerScript, &e.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("GetEndpoint: %w", err)
 	}
@@ -55,7 +56,7 @@ func (s *Store) GetEndpoint(ctx context.Context, id uuid.UUID) (*models.Endpoint
 
 func (s *Store) ListEndpoints(ctx context.Context) ([]models.Endpoint, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT id, name, target_url, created_at FROM endpoints ORDER BY created_at DESC`,
+		`SELECT id, name, target_url, transformer_script, created_at FROM endpoints ORDER BY created_at DESC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("ListEndpoints: %w", err)
@@ -65,7 +66,7 @@ func (s *Store) ListEndpoints(ctx context.Context) ([]models.Endpoint, error) {
 	var endpoints []models.Endpoint
 	for rows.Next() {
 		var e models.Endpoint
-		if err := rows.Scan(&e.ID, &e.Name, &e.TargetURL, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.Name, &e.TargetURL, &e.TransformerScript, &e.CreatedAt); err != nil {
 			return nil, fmt.Errorf("ListEndpoints scan: %w", err)
 		}
 		endpoints = append(endpoints, e)

@@ -42,8 +42,9 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // POST /endpoints
 func (h *Handler) CreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name      string `json:"name"`
-		TargetURL string `json:"target_url"`
+		Name              string `json:"name"`
+		TargetURL         string `json:"target_url"`
+		TransformerScript string `json:"transformer_script"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -54,7 +55,7 @@ func (h *Handler) CreateEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	endpoint, err := h.store.CreateEndpoint(r.Context(), body.Name, body.TargetURL)
+	endpoint, err := h.store.CreateEndpoint(r.Context(), body.Name, body.TargetURL, body.TransformerScript)
 	if err != nil {
 		h.logger.Error("CreateEndpoint failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create endpoint")

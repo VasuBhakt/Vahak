@@ -8,10 +8,11 @@ import (
 )
 
 type Endpoint struct {
-	ID        uuid.UUID `json:"id"`
-	Name      string    `json:"name"`
-	TargetURL string    `json:"target_url"`
-	CreatedAt time.Time `json:"created_at"`
+	ID                uuid.UUID `json:"id"`
+	Name              string    `json:"name"`
+	TargetURL         string    `json:"target_url"`
+	TransformerScript string    `json:"transformer_script,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 type Request struct {
