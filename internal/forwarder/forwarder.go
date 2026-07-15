@@ -131,7 +131,7 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 	}
 
 	// schedule next retry with exponential backoff
-	nextAttempt := time.Now().Add(backoff(attempts))
+	nextAttempt := CalculateNextAttempt(attempts)
 	f.store.UpdateJobStatus(ctx, job.ID, "pending", attempts, nextAttempt)
 	f.logger.Info("retry scheduled",
 		zap.String("job_id", job.ID.String()),
@@ -174,17 +174,4 @@ func (f *Forwarder) deliver(targetURL string, req *models.Request) error {
 	}
 
 	return nil
-}
-
-// exponential backoff
-func backoff(attempts int) time.Duration {
-	base := InitialBackoff * time.Second
-	for i := 0; i < attempts-1; i++ {
-		base *= InitialBackoff
-		if base > 30*time.Minute {
-			base = 30 * time.Minute
-			break
-		}
-	}
-	return base
 }
