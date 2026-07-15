@@ -60,7 +60,10 @@ func main() {
 	// init store
 	st := store.New(pool)
 
-	h := api.New(st, logger)
+	// init hub
+	hub := api.NewHub()
+
+	h := api.New(st, logger, hub)
 
 	// middleware for protected routes
 	apiKeyMiddleware := func(next http.Handler) http.Handler {
@@ -97,6 +100,7 @@ func main() {
 		r.Delete("/endpoints/{id}", h.DeleteEndpoint)
 		r.Get("/endpoints/{id}/requests", h.GetRequests)
 		r.Post("/endpoints/{id}/replay/{request_id}", h.ReplayRequest)
+		r.Get("/ws/{id}", h.ServeWS)
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

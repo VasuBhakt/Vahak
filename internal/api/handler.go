@@ -16,10 +16,15 @@ import (
 type Handler struct {
 	store  *store.Store
 	logger *zap.Logger
+	hub    *Hub
 }
 
-func New(store *store.Store, logger *zap.Logger) *Handler {
-	return &Handler{store: store, logger: logger}
+func New(store *store.Store, logger *zap.Logger, hub *Hub) *Handler {
+	return &Handler{
+		store:  store,
+		logger: logger,
+		hub:    hub,
+	}
 }
 
 // helpers
@@ -176,6 +181,9 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to save request")
 		return
 	}
+
+	// broadcast to live dashboard clients
+	h.hub.Broadcast(id, req)
 
 	// create delivery job
 	if _, err := h.store.CreateDeliveryJob(r.Context(), req.ID, endpoint.TargetURL); err != nil {
