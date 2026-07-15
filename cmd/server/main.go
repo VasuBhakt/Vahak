@@ -13,6 +13,7 @@ import (
 	"github.com/VasuBhakt/vahak/config"
 	"github.com/VasuBhakt/vahak/internal/api"
 	"github.com/VasuBhakt/vahak/internal/forwarder"
+	"github.com/VasuBhakt/vahak/internal/queue"
 	"github.com/VasuBhakt/vahak/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -60,10 +61,11 @@ func main() {
 	// init store
 	st := store.New(pool)
 
-	// init hub
+	// init hub and queue
 	hub := api.NewHub()
+	jq := queue.NewJobQueue(10000)
 
-	h := api.New(st, logger, hub)
+	h := api.New(st, logger, hub, jq)
 
 	// middleware for protected routes
 	apiKeyMiddleware := func(next http.Handler) http.Handler {
@@ -107,7 +109,7 @@ func main() {
 	defer cancel()
 
 	// start forwarder
-	fwd := forwarder.New(st, logger)
+	fwd := forwarder.New(st, logger, jq)
 	fwd.Start(ctx)
 
 	// graceful shutdown

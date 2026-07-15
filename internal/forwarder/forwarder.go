@@ -5,9 +5,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/VasuBhakt/vahak/internal/models"
+	"github.com/VasuBhakt/vahak/internal/queue"
 	"github.com/VasuBhakt/vahak/internal/store"
 	"github.com/VasuBhakt/vahak/internal/transformer"
 	"github.com/google/uuid"
@@ -20,15 +22,18 @@ const (
 )
 
 type Forwarder struct {
-	store  *store.Store
-	logger *zap.Logger
-	client *http.Client
+	store      *store.Store
+	logger     *zap.Logger
+	client     *http.Client
+	queue      *queue.JobQueue
+	processing sync.Map
 }
 
-func New(store *store.Store, logger *zap.Logger) *Forwarder {
+func New(store *store.Store, logger *zap.Logger, jq *queue.JobQueue) *Forwarder {
 	return &Forwarder{
 		store:  store,
 		logger: logger,
+		queue:  jq,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -37,11 +42,25 @@ func New(store *store.Store, logger *zap.Logger) *Forwarder {
 
 // Start - runs the forwarder loop in the background
 func (f *Forwarder) Start(ctx context.Context) {
+	// 1. Fast-Path Memory Queue Consumer
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		f.logger.Info("fast-path queue consumer started")
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case job := <-f.queue.Jobs:
+				go f.processJob(ctx, job)
+			}
+		}
+	}()
+
+	// 2. DB Sweeper Loop (Reliability / Retries)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 
-		f.logger.Info("forwarder started")
+		f.logger.Info("database sweeper started")
 
 		for {
 			select {
@@ -68,6 +87,12 @@ func (f *Forwarder) processPendingJobs(ctx context.Context) {
 }
 
 func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
+	// Prevent duplicate concurrent processing of the same job
+	if _, loaded := f.processing.LoadOrStore(job.ID, true); loaded {
+		return
+	}
+	defer f.processing.Delete(job.ID)
+
 	// get the original request
 	req, err := f.store.GetRequest(ctx, job.RequestID)
 	if err != nil {

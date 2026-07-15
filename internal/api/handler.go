@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/VasuBhakt/vahak/internal/models"
+	"github.com/VasuBhakt/vahak/internal/queue"
 	"github.com/VasuBhakt/vahak/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -17,13 +18,15 @@ type Handler struct {
 	store  *store.Store
 	logger *zap.Logger
 	hub    *Hub
+	queue  *queue.JobQueue
 }
 
-func New(store *store.Store, logger *zap.Logger, hub *Hub) *Handler {
+func New(store *store.Store, logger *zap.Logger, hub *Hub, jq *queue.JobQueue) *Handler {
 	return &Handler{
 		store:  store,
 		logger: logger,
 		hub:    hub,
+		queue:  jq,
 	}
 }
 
@@ -187,9 +190,13 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 	h.hub.Broadcast(id, req)
 
 	// create delivery job
-	if _, err := h.store.CreateDeliveryJob(r.Context(), req.ID, endpoint.TargetURL); err != nil {
+	job, err := h.store.CreateDeliveryJob(r.Context(), req.ID, endpoint.TargetURL)
+	if err != nil {
 		h.logger.Error("CreateDeliveryJob failed", zap.Error(err))
 		// non-critical, webhook is captured regardless
+	} else {
+		// push to fast-path in-memory queue
+		h.queue.Push(*job)
 	}
 
 	h.logger.Info("webhook captured",
