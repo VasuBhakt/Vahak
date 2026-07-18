@@ -10,6 +10,7 @@ import (
 type Endpoint struct {
 	ID                uuid.UUID `json:"id"`
 	Name              string    `json:"name"`
+	UserID            uuid.UUID `json:"user_id"`
 	TargetURL         string    `json:"target_url"`
 	TransformerScript string    `json:"transformer_script,omitempty"`
 	CreatedAt         time.Time `json:"created_at"`
@@ -34,4 +35,21 @@ type DeliveryJob struct {
 	LastAttempt *time.Time `json:"last_attempt"`
 	NextAttempt time.Time  `json:"next_attempt"`
 	CreatedAt   time.Time  `json:"created_at"`
+}
+
+type User struct {
+	ID                        uuid.UUID  `json:"id"`
+	Email                     string     `json:"email"`
+	Username                  string     `json:"username"`
+	FirstName                 string     `json:"first_name"`
+	LastName                  string     `json:"last_name"`
+	Password                  string     `json:"-"`
+	VerificationToken         string     `json:"-"`
+	VerificationTokenExpiry   time.Time  `json:"-"`
+	Verified                  bool       `json:"verified"`
+	ForgotPasswordToken       string     `json:"-"`
+	ForgotPasswordTokenExpiry time.Time  `json:"-"`
+	Endpoints                 []Endpoint `json:"endpoints"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
 }

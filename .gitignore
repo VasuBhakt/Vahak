@@ -10,3 +10,5 @@
 # IDE
 .vscode/
 .idea/
+
+db_sync.go
