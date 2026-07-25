@@ -99,6 +99,7 @@ func main() {
 		r.Post("/endpoints", h.CreateEndpoint)
 		r.Get("/endpoints", h.ListEndpoints)
 		r.Get("/endpoints/{id}", h.GetEndpoint)
+		r.Put("/endpoints/{id}", h.UpdateEndpoint)
 		r.Delete("/endpoints/{id}", h.DeleteEndpoint)
 		r.Get("/endpoints/{id}/requests", h.GetRequests)
 		r.Post("/endpoints/{id}/replay/{request_id}", h.ReplayRequest)

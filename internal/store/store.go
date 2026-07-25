@@ -54,6 +54,17 @@ func (s *Store) GetEndpoint(ctx context.Context, id uuid.UUID) (*models.Endpoint
 	return e, nil
 }
 
+func (s *Store) UpdateEndpoint(ctx context.Context, id uuid.UUID, name, targetUrl, transformer string) (*models.Endpoint, error) {
+	_, err := s.db.Exec(ctx,
+		`UPDATE endpoints SET name = $1, target_url = $2, transformer_script = $3 WHERE id = $4`,
+		name, targetUrl, transformer, id,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("UpdateEndpoint: %w", err)
+	}
+	return s.GetEndpoint(ctx, id)
+}
+
 func (s *Store) ListEndpoints(ctx context.Context) ([]models.Endpoint, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT id, name, target_url, transformer_script, created_at FROM endpoints ORDER BY created_at DESC`,

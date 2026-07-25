@@ -98,6 +98,58 @@ func (h *Handler) GetEndpoint(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, endpoint)
 }
 
+// PUT /endpoints/{id}
+func (h *Handler) UpdateEndpoint(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid endpoint id")
+		return
+	}
+
+	// Fetch existing endpoint first
+	existing, err := h.store.GetEndpoint(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "endpoint not found")
+		return
+	}
+
+	// Use pointers so we can distinguish between omitted fields (nil) and empty strings ("")
+	var body struct {
+		Name              *string `json:"name"`
+		TargetURL         *string `json:"target_url"`
+		TransformerScript *string `json:"transformer_script"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Merge fields if they were provided in the JSON payload
+	if body.Name != nil {
+		existing.Name = *body.Name
+	}
+	if body.TargetURL != nil {
+		existing.TargetURL = *body.TargetURL
+	}
+	if body.TransformerScript != nil {
+		existing.TransformerScript = *body.TransformerScript
+	}
+
+	if existing.TargetURL == "" || existing.Name == "" {
+		writeError(w, http.StatusBadRequest, "target_url and name cannot be empty")
+		return
+	}
+
+	endpoint, err := h.store.UpdateEndpoint(r.Context(), id, existing.Name, existing.TargetURL, existing.TransformerScript)
+	if err != nil {
+		h.logger.Error("UpdateEndpoint failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to update endpoint")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, endpoint)
+}
+
 // DELETE /endpoints/{id}
 func (h *Handler) DeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
