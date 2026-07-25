@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Activity, Plus, Settings2, Trash2, X } from 'lucide-react';
+import { Activity, Plus, Settings2, Trash2, X, Copy } from 'lucide-react';
 
 interface Endpoint {
   id: string;
@@ -80,6 +80,18 @@ function App() {
     }
   };
 
+  const copyWebhookUrl = (id: string) => {
+    const url = `http://localhost:8080/hooks/${id}`;
+    navigator.clipboard.writeText(url);
+    // Simple feedback without bulky toast libraries
+    const btn = document.getElementById(`copy-btn-${id}`);
+    if (btn) {
+      const originalColor = btn.style.color;
+      btn.style.color = 'var(--success)';
+      setTimeout(() => btn.style.color = originalColor, 1000);
+    }
+  };
+
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
@@ -146,14 +158,20 @@ function App() {
       <div className="endpoint-grid">
         {endpoints.map((ep) => (
           <div key={ep.id} className="endpoint-card">
-            <h3><span className="status-indicator"></span> {ep.name}</h3>
-            <p style={{ marginTop: 8 }}>{ep.target_url}</p>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3><span className="status-indicator"></span> {ep.name}</h3>
+            </div>
+            <p style={{ fontSize: 11, fontFamily: 'monospace', color: 'var(--text-secondary)', marginTop: 4 }}>ID: {ep.id}</p>
+            <p style={{ marginTop: 12 }}>{ep.target_url}</p>
             
             <div style={{ marginTop: 24, display: 'flex', gap: 16, justifyContent: 'flex-end', borderTop: '1px solid var(--border-color)', paddingTop: 16 }}>
-              <button onClick={() => openEditModal(ep)} style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', padding: 4 }}>
+              <button id={`copy-btn-${ep.id}`} onClick={() => copyWebhookUrl(ep.id)} style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', padding: 4, marginRight: 'auto', transition: 'color 0.2s' }} title="Copy Webhook URL">
+                <Copy size={16} />
+              </button>
+              <button onClick={() => openEditModal(ep)} style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', padding: 4 }} title="Settings">
                 <Settings2 size={16} />
               </button>
-              <button onClick={() => handleDelete(ep.id)} style={{ background: 'transparent', border: 'none', color: 'var(--danger)', cursor: 'pointer', padding: 4 }}>
+              <button onClick={() => handleDelete(ep.id)} style={{ background: 'transparent', border: 'none', color: 'var(--danger)', cursor: 'pointer', padding: 4 }} title="Delete">
                 <Trash2 size={16} />
               </button>
             </div>
