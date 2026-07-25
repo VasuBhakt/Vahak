@@ -23,8 +23,16 @@ func getCompiledScript(script string) (*goja.Program, error) {
 	if cached, ok := scriptCache.Load(script); ok {
 		return cached.(*goja.Program), nil
 	}
-	// wrap the script
-	wrappedScript := fmt.Sprintf(`(function(payload) {%s return payload;})(payload);`, script)
+	// wrap the script to support both inline mutation and explicit transform() function
+	wrappedScript := fmt.Sprintf(`
+		(function(payload) {
+			%s
+			if (typeof transform === 'function') {
+				return transform(payload);
+			}
+			return payload;
+		})(payload);
+	`, script)
 
 	// compile it into machine bytecode
 	prog, err := goja.Compile("", wrappedScript, false)
