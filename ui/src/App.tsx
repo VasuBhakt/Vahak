@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Activity, Plus, Settings2, Trash2, X, Copy } from 'lucide-react';
+import { Activity, Plus, Settings2, Trash2, X, Copy, ArrowLeft, RefreshCw, Play } from 'lucide-react';
 
 interface Endpoint {
   id: string;
@@ -7,6 +7,15 @@ interface Endpoint {
   target_url: string;
   transformer_script: string;
   created_at: string;
+}
+
+interface RequestLog {
+  id: string;
+  endpoint_id: string;
+  method: string;
+  source_ip: string;
+  body: string;
+  received_at: string;
 }
 
 function App() {
@@ -18,6 +27,11 @@ function App() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [formData, setFormData] = useState({ name: '', target_url: '', transformer_script: '' });
+
+  // Detail View State
+  const [selectedEndpoint, setSelectedEndpoint] = useState<Endpoint | null>(null);
+  const [requests, setRequests] = useState<RequestLog[]>([]);
+  const [expandedRequestId, setExpandedRequestId] = useState<string | null>(null);
 
   const fetchEndpoints = async () => {
     try {
@@ -35,11 +49,29 @@ function App() {
     }
   };
 
+  const fetchRequests = async (id: string) => {
+    try {
+      const res = await fetch(`/api/endpoints/${id}/requests`, {
+        headers: { 'X-Api-Key': apiKey }
+      });
+      const data = await res.json();
+      setRequests(data || []);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   useEffect(() => {
     if (isAuthed) {
       fetchEndpoints();
     }
   }, [isAuthed]);
+
+  useEffect(() => {
+    if (selectedEndpoint) {
+      fetchRequests(selectedEndpoint.id);
+    }
+  }, [selectedEndpoint]);
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
@@ -61,34 +93,49 @@ function App() {
     setIsModalOpen(true);
   };
 
-  const openEditModal = (ep: Endpoint) => {
+  const openEditModal = (ep: Endpoint, e: React.MouseEvent) => {
+    e.stopPropagation();
     setEditingId(ep.id);
     setFormData({ name: ep.name, target_url: ep.target_url, transformer_script: ep.transformer_script });
     setIsModalOpen(true);
   };
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
     if (!confirm('Are you sure you want to delete this endpoint?')) return;
     try {
       await fetch(`/api/endpoints/${id}`, {
         method: 'DELETE',
         headers: { 'X-Api-Key': apiKey }
       });
+      if (selectedEndpoint?.id === id) setSelectedEndpoint(null);
       fetchEndpoints();
     } catch (err) {
       console.error(err);
     }
   };
 
-  const copyWebhookUrl = (id: string) => {
+  const copyWebhookUrl = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
     const url = `http://localhost:8080/hooks/${id}`;
     navigator.clipboard.writeText(url);
-    // Simple feedback without bulky toast libraries
     const btn = document.getElementById(`copy-btn-${id}`);
     if (btn) {
       const originalColor = btn.style.color;
       btn.style.color = 'var(--success)';
       setTimeout(() => btn.style.color = originalColor, 1000);
+    }
+  };
+
+  const handleReplay = async (requestId: string, endpointId: string) => {
+    try {
+      await fetch(`/api/endpoints/${endpointId}/replay/${requestId}`, {
+        method: 'POST',
+        headers: { 'X-Api-Key': apiKey }
+      });
+      alert('Replay queued successfully!');
+    } catch (err) {
+      console.error(err);
     }
   };
 
@@ -146,38 +193,102 @@ function App() {
           <h1>Vahak</h1>
         </div>
         <div style={{ display: 'flex', gap: 16, alignItems: 'center' }}>
-          <button onClick={openNewModal} className="btn-primary" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 16px', background: 'transparent', border: '1px solid var(--border-color)', color: 'var(--text-primary)' }}>
-            <Plus size={16} /> New Endpoint
-          </button>
+          {!selectedEndpoint && (
+            <button onClick={openNewModal} className="btn-primary" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 16px', background: 'transparent', border: '1px solid var(--border-color)', color: 'var(--text-primary)' }}>
+              <Plus size={16} /> New Endpoint
+            </button>
+          )}
           <button onClick={handleLogout} style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 14 }}>
             Sign Out
           </button>
         </div>
       </header>
 
-      <div className="endpoint-grid">
-        {endpoints.map((ep) => (
-          <div key={ep.id} className="endpoint-card">
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <h3><span className="status-indicator"></span> {ep.name}</h3>
-            </div>
-            <p style={{ fontSize: 11, fontFamily: 'monospace', color: 'var(--text-secondary)', marginTop: 4 }}>ID: {ep.id}</p>
-            <p style={{ marginTop: 12 }}>{ep.target_url}</p>
-            
-            <div style={{ marginTop: 24, display: 'flex', gap: 16, justifyContent: 'flex-end', borderTop: '1px solid var(--border-color)', paddingTop: 16 }}>
-              <button id={`copy-btn-${ep.id}`} onClick={() => copyWebhookUrl(ep.id)} style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', padding: 4, marginRight: 'auto', transition: 'color 0.2s' }} title="Copy Webhook URL">
-                <Copy size={16} />
-              </button>
-              <button onClick={() => openEditModal(ep)} style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', padding: 4 }} title="Settings">
-                <Settings2 size={16} />
-              </button>
-              <button onClick={() => handleDelete(ep.id)} style={{ background: 'transparent', border: 'none', color: 'var(--danger)', cursor: 'pointer', padding: 4 }} title="Delete">
-                <Trash2 size={16} />
-              </button>
-            </div>
+      {selectedEndpoint ? (
+        <div className="detail-view" style={{ animation: 'fadeIn 0.2s ease-in' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 24 }}>
+            <button onClick={() => setSelectedEndpoint(null)} style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', padding: 4 }}>
+              <ArrowLeft size={20} />
+            </button>
+            <h2 style={{ fontSize: 20, margin: 0 }}>{selectedEndpoint.name} <span style={{ fontSize: 12, color: 'var(--text-secondary)', marginLeft: 8, fontFamily: 'monospace' }}>{selectedEndpoint.id}</span></h2>
+            <button onClick={() => fetchRequests(selectedEndpoint.id)} style={{ marginLeft: 'auto', background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+              <RefreshCw size={14} /> Refresh Logs
+            </button>
           </div>
-        ))}
-      </div>
+
+          <div style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-color)', borderRadius: 8, overflow: 'hidden' }}>
+            {requests.length === 0 ? (
+              <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-secondary)' }}>No webhooks received yet.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '150px 100px 150px 1fr 100px', padding: '12px 16px', borderBottom: '1px solid var(--border-color)', fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600 }}>
+                  <span>Time</span>
+                  <span>Method</span>
+                  <span>Source IP</span>
+                  <span>Payload Preview</span>
+                  <span style={{ textAlign: 'right' }}>Actions</span>
+                </div>
+                {requests.map(req => (
+                  <div key={req.id} style={{ display: 'flex', flexDirection: 'column', borderBottom: '1px solid var(--border-color)' }}>
+                    <div 
+                      style={{ display: 'grid', gridTemplateColumns: '150px 100px 150px 1fr 100px', padding: '12px 16px', alignItems: 'center', fontSize: 13, cursor: 'pointer' }}
+                      onClick={() => setExpandedRequestId(expandedRequestId === req.id ? null : req.id)}
+                    >
+                      <span style={{ color: 'var(--text-secondary)' }}>{new Date(req.received_at).toLocaleTimeString()}</span>
+                      <span style={{ fontWeight: 600, color: 'var(--accent)' }}>{req.method}</span>
+                      <span style={{ fontFamily: 'monospace', color: 'var(--text-secondary)' }}>{req.source_ip}</span>
+                      <span style={{ fontFamily: 'monospace', color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', paddingRight: 16 }}>
+                        {req.body}
+                      </span>
+                      <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                        <button 
+                          onClick={(e) => { e.stopPropagation(); handleReplay(req.id, selectedEndpoint.id); }} 
+                          style={{ background: 'var(--bg-base)', border: '1px solid var(--border-color)', color: 'var(--text-primary)', padding: '4px 8px', borderRadius: 4, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}
+                          title="Replay Webhook"
+                        >
+                          <Play size={10} /> Replay
+                        </button>
+                      </div>
+                    </div>
+                    {expandedRequestId === req.id && (
+                      <div style={{ padding: '16px', background: 'var(--bg-base)', borderTop: '1px dashed var(--border-color)' }}>
+                        <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 1 }}>Raw JSON Payload</div>
+                        <pre style={{ margin: 0, padding: 12, background: 'rgba(0,0,0,0.3)', borderRadius: 4, fontSize: 12, color: 'var(--text-primary)', overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                          {req.body}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="endpoint-grid">
+          {endpoints.map((ep) => (
+            <div key={ep.id} className="endpoint-card" onClick={() => setSelectedEndpoint(ep)} style={{ cursor: 'pointer', transition: 'border-color 0.2s' }} onMouseEnter={(e) => e.currentTarget.style.borderColor = 'var(--text-secondary)'} onMouseLeave={(e) => e.currentTarget.style.borderColor = 'var(--border-color)'}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <h3><span className="status-indicator"></span> {ep.name}</h3>
+              </div>
+              <p style={{ fontSize: 11, fontFamily: 'monospace', color: 'var(--text-secondary)', marginTop: 4 }}>ID: {ep.id}</p>
+              <p style={{ marginTop: 12 }}>{ep.target_url}</p>
+              
+              <div style={{ marginTop: 24, display: 'flex', gap: 16, justifyContent: 'flex-end', borderTop: '1px solid var(--border-color)', paddingTop: 16 }}>
+                <button id={`copy-btn-${ep.id}`} onClick={(e) => copyWebhookUrl(ep.id, e)} style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', padding: 4, marginRight: 'auto', transition: 'color 0.2s' }} title="Copy Webhook URL">
+                  <Copy size={16} />
+                </button>
+                <button onClick={(e) => openEditModal(ep, e)} style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', padding: 4 }} title="Settings">
+                  <Settings2 size={16} />
+                </button>
+                <button onClick={(e) => handleDelete(ep.id, e)} style={{ background: 'transparent', border: 'none', color: 'var(--danger)', cursor: 'pointer', padding: 4 }} title="Delete">
+                  <Trash2 size={16} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {isModalOpen && (
         <div className="modal-overlay">

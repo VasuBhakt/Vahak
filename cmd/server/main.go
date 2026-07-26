@@ -9,12 +9,13 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-
 	"github.com/VasuBhakt/vahak/config"
 	"github.com/VasuBhakt/vahak/internal/api"
 	"github.com/VasuBhakt/vahak/internal/forwarder"
 	"github.com/VasuBhakt/vahak/internal/queue"
 	"github.com/VasuBhakt/vahak/internal/store"
+	"github.com/VasuBhakt/vahak/ui"
+	"io/fs"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/golang-migrate/migrate/v4"
@@ -94,7 +95,7 @@ func main() {
 	r.Post("/hooks/{id}", h.CaptureWebhook)
 
 	// protected
-	r.Group(func(r chi.Router) {
+	r.Route("/api", func(r chi.Router) {
 		r.Use(apiKeyMiddleware)
 		r.Post("/endpoints", h.CreateEndpoint)
 		r.Get("/endpoints", h.ListEndpoints)
@@ -105,6 +106,13 @@ func main() {
 		r.Post("/endpoints/{id}/replay/{request_id}", h.ReplayRequest)
 		r.Get("/ws/{id}", h.ServeWS)
 	})
+
+	// serve embedded UI
+	staticFS, err := fs.Sub(ui.StaticFiles, "dist")
+	if err != nil {
+		logger.Fatal("failed to load static files", zap.Error(err))
+	}
+	r.Handle("/*", http.FileServer(http.FS(staticFS)))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
