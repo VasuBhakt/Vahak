@@ -32,14 +32,7 @@ services:
       db:
         condition: service_healthy
 
-  sink:
-    build:
-      context: .
-      dockerfile: Dockerfile.sink
-    ports:
-      - "9090:9090"
-    profiles:
-      - test
+
 
 volumes:
   postgres_data:

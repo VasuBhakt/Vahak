@@ -1,0 +1,8 @@
+version: '3.8'
+services:
+  sink:
+    build:
+      context: .
+      dockerfile: Dockerfile.sink
+    ports:
+      - "9090:9090"
