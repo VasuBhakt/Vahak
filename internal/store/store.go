@@ -222,12 +222,21 @@ func (s *Store) UpdateJobStatus(ctx context.Context, id uuid.UUID, status string
 // This replaces N individual UPDATE statements with one, eliminating table lock contention
 // against the ingester's CopyFrom operations on the delivery_jobs table.
 func (s *Store) BatchMarkDelivered(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	
+	strIDs := make([]string, len(ids))
+	for i, id := range ids {
+		strIDs[i] = id.String()
+	}
+
 	now := time.Now()
 	_, err := s.db.Exec(ctx,
 		`UPDATE delivery_jobs
 		 SET status = 'delivered', last_attempt = $1, next_attempt = $1
-		 WHERE id = ANY($2)`,
-		now, ids,
+		 WHERE id = ANY($2::uuid[])`,
+		now, strIDs,
 	)
 	if err != nil {
 		return fmt.Errorf("BatchMarkDelivered: %w", err)

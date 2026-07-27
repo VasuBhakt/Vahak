@@ -2,7 +2,7 @@
 
 Vahak is a high-performance webhook delivery engine written in Go. It handles reliable ingestion, JavaScript payload transformation, and outgoing delivery with a PostgreSQL backing store. 
 
-Designed for high concurrency and resilience on a **single node**, Vahak utilizes channel-based batching, a bounded worker pool, and circuit breakers to achieve **3,500+ RPS** (Requests Per Second) on standard hardware. By intentionally avoiding distributed systems complexity (like Redis or RabbitMQ), Vahak prioritizes extreme ease of testing, local development, and one-click deployment.
+Designed for high concurrency and resilience on a **single node**, Vahak utilizes channel-based batching, a bounded worker pool, and circuit breakers to achieve **3,000+ RPS** (Requests Per Second) on standard hardware. By intentionally avoiding distributed systems complexity (like Redis or RabbitMQ), Vahak prioritizes extreme ease of testing, local development, and one-click deployment.
 
 It is built to be brutally simple and eliminate operational complexity:
 - 📦 **Single Static Binary:** No massive dependency trees, Python environments, or Node.js installations.
@@ -51,7 +51,7 @@ graph TD
 
 Because Vahak is designed to max out a single machine, these benchmarks were run locally using `hey` within a Linux Docker environment (to bypass Windows TCP proxy bottlenecks):
 
-- **Ingestion & Delivery:** 3,500 Requests Per Second (**300 million webhooks/day** on a single node)
+- **Ingestion & Delivery:** 3,000 Requests Per Second (**250 million webhooks/day** on a single node)
 - **Payload:** 22 bytes (`{"event": "load.test"}`)
 - **Concurrency:** 500 simultaneous connections
 - **Database Limits:** PostgreSQL tuned with `max_connections=250`.
@@ -86,6 +86,7 @@ Vahak is configured via standard environment variables:
 | `DB_URL` | PostgreSQL connection string. | (Required) |
 | `DB_POOL_URL` | Used for `pgxpool` connections. | (Required) |
 | `API_KEY` | Secret key for authenticating `/api/*` endpoints. | (Required) |
+| `ALLOW_LOCAL_TARGETS` | Set to `true` to disable SSRF protection for local testing/internal networks. | `false` |
 
 ## 🚀 Getting Started
 

@@ -6,3 +6,7 @@ services:
       dockerfile: Dockerfile.sink
     ports:
       - "9090:9090"
+
+  vahak:
+    environment:
+      - ALLOW_LOCAL_TARGETS=true

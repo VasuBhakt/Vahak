@@ -8,10 +8,11 @@ import (
 )
 
 type Config struct {
-	DBUrl     string
-	DBPoolUrl string
-	Port      string
-	APIKey    string
+	DBUrl             string
+	DBPoolUrl         string
+	Port              string
+	APIKey            string
+	AllowLocalTargets bool
 }
 
 func Load() *Config {
@@ -20,10 +21,13 @@ func Load() *Config {
 		log.Println("no .env file found, reading from environment")
 	}
 
+	allowLocal := os.Getenv("ALLOW_LOCAL_TARGETS") == "true"
+
 	return &Config{
-		DBUrl:     os.Getenv("DB_URL"),
-		DBPoolUrl: os.Getenv("DB_POOL_URL"),
-		Port:      os.Getenv("PORT"),
-		APIKey:    os.Getenv("API_KEY"),
+		DBUrl:             os.Getenv("DB_URL"),
+		DBPoolUrl:         os.Getenv("DB_POOL_URL"),
+		Port:              os.Getenv("PORT"),
+		APIKey:            os.Getenv("API_KEY"),
+		AllowLocalTargets: allowLocal,
 	}
 }

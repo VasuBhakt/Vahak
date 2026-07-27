@@ -123,7 +123,7 @@ func main() {
 	st.StartBatchWorker(ctx, ingestCh)
 
 	// start forwarder
-	fwd := forwarder.New(st, logger, jq)
+	fwd := forwarder.New(st, logger, jq, cfg.AllowLocalTargets)
 	fwd.Start(ctx)
 
 	// graceful shutdown

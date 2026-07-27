@@ -33,7 +33,7 @@ type Forwarder struct {
 	circuits    *CircuitManager     // per-endpoint circuit breaker to avoid hammering dead targets
 }
 
-func New(store *store.Store, logger *zap.Logger, jq *queue.JobQueue) *Forwarder {
+func New(store *store.Store, logger *zap.Logger, jq *queue.JobQueue, allowLocal bool) *Forwarder {
 	// SSRF Protection: custom dialer that blocks private and loopback IPs
 	dialer := &net.Dialer{
 		Timeout:   5 * time.Second,
@@ -51,7 +51,7 @@ func New(store *store.Store, logger *zap.Logger, jq *queue.JobQueue) *Forwarder 
 			}
 			for _, ip := range ips {
 				// Block loopback, private networks, and unspecified IPs
-				if ip.IP.IsPrivate() || ip.IP.IsLoopback() || ip.IP.IsUnspecified() {
+				if !allowLocal && (ip.IP.IsPrivate() || ip.IP.IsLoopback() || ip.IP.IsUnspecified()) {
 					return nil, errors.New("SSRF blocked: private/loopback IP address not allowed")
 				}
 			}
