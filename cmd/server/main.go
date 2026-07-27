@@ -3,19 +3,20 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
 	"github.com/VasuBhakt/vahak/config"
 	"github.com/VasuBhakt/vahak/internal/api"
 	"github.com/VasuBhakt/vahak/internal/forwarder"
 	"github.com/VasuBhakt/vahak/internal/queue"
 	"github.com/VasuBhakt/vahak/internal/store"
 	"github.com/VasuBhakt/vahak/ui"
-	"io/fs"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/golang-migrate/migrate/v4"
@@ -65,8 +66,9 @@ func main() {
 	// init hub and queue
 	hub := api.NewHub()
 	jq := queue.NewJobQueue(10000)
+	ingestCh := make(chan *store.IngestItem, 10000)
 
-	h := api.New(st, logger, hub, jq)
+	h := api.New(st, logger, hub, jq, ingestCh)
 
 	// middleware for protected routes
 	apiKeyMiddleware := func(next http.Handler) http.Handler {
@@ -116,6 +118,9 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// start batch ingester background worker (must be after ctx is created)
+	st.StartBatchWorker(ctx, ingestCh)
 
 	// start forwarder
 	fwd := forwarder.New(st, logger, jq)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/VasuBhakt/vahak/internal/models"
@@ -15,19 +16,30 @@ import (
 )
 
 type Handler struct {
-	store  *store.Store
-	logger *zap.Logger
-	hub    *Hub
-	queue  *queue.JobQueue
+	store      *store.Store
+	logger     *zap.Logger
+	hub        *Hub
+	queue      *queue.JobQueue
+	epCache    sync.Map
+	ingestCh   chan *store.IngestItem
+	resultPool sync.Pool // reuse chan error to reduce GC pressure
 }
 
-func New(store *store.Store, logger *zap.Logger, hub *Hub, jq *queue.JobQueue) *Handler {
-	return &Handler{
-		store:  store,
-		logger: logger,
-		hub:    hub,
-		queue:  jq,
+func New(store *store.Store, logger *zap.Logger, hub *Hub, jq *queue.JobQueue, ingestCh chan *store.IngestItem) *Handler {
+	h := &Handler{
+		store:    store,
+		logger:   logger,
+		hub:      hub,
+		queue:    jq,
+		ingestCh: ingestCh,
 	}
+	h.resultPool = sync.Pool{
+		New: func() any {
+			ch := make(chan error, 1)
+			return ch
+		},
+	}
+	return h
 }
 
 // helpers
@@ -147,6 +159,8 @@ func (h *Handler) UpdateEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.epCache.Store(id, endpoint)
+
 	writeJSON(w, http.StatusOK, endpoint)
 }
 
@@ -162,6 +176,7 @@ func (h *Handler) DeleteEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "failed to delete endpoint")
 		return
 	}
+	h.epCache.Delete(id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -196,14 +211,26 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// verify endpoint exists
-	endpoint, err := h.store.GetEndpoint(r.Context(), id)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "endpoint not found")
-		return
+	var endpoint *models.Endpoint
+	if cached, ok := h.epCache.Load(id); ok {
+		endpoint = cached.(*models.Endpoint)
+	} else {
+		ep, err := h.store.GetEndpoint(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "endpoint not found")
+			return
+		}
+		h.epCache.Store(id, ep)
+		endpoint = ep
 	}
 
-	// extract headers
-	headers := r.Header.Clone()
+	// extract only the headers that matter — skip noisy client headers
+	headers := make(http.Header)
+	for _, key := range []string{"Content-Type", "X-Signature", "X-Hub-Signature", "X-Hub-Signature-256", "User-Agent"} {
+		if val := r.Header.Get(key); val != "" {
+			headers.Set(key, val)
+		}
+	}
 
 	// limit body size to 1MB
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -232,29 +259,59 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 		ReceivedAt: time.Now(),
 	}
 
-	if err := h.store.SaveRequest(r.Context(), req); err != nil {
-		h.logger.Error("SaveRequest failed", zap.Error(err))
+	// prepare delivery job - carry request data in-memory to skip DB reads in forwarder
+	job := &models.DeliveryJob{
+		ID:                    uuid.New(),
+		RequestID:             req.ID,
+		TargetURL:             endpoint.TargetURL,
+		Status:                "pending",
+		Attempts:              0,
+		NextAttempt:           time.Now(),
+		CreatedAt:             time.Now(),
+		InMemMethod:           req.Method,
+		InMemHeaders:          headers,
+		InMemBody:             bodyStr,
+		InMemTransformerScript: endpoint.TransformerScript,
+	}
+
+	// acquire a result channel from the pool
+	resultCh := h.resultPool.Get().(chan error)
+	item := &store.IngestItem{
+		Request: req,
+		Job:     job,
+		Result:  resultCh,
+	}
+
+	// push to batcher memory queue with a timeout.
+	// If the queue is full (system overloaded or postgres down), we return 503
+	// immediately rather than blocking the HTTP connection indefinitely.
+	select {
+	case h.ingestCh <- item:
+	case <-time.After(5 * time.Second):
+		h.resultPool.Put(resultCh)
+		writeError(w, http.StatusServiceUnavailable, "system overloaded, try again later")
+		return
+	}
+
+	// block ONLY until the background worker flushes the batch to disk
+	if err := <-resultCh; err != nil {
+		h.resultPool.Put(resultCh)
+		h.logger.Error("Batch ingest failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to save request")
 		return
 	}
+	h.resultPool.Put(resultCh)
+
+	// now push to fast-path in-memory queue for delivery
+	h.queue.Push(*job)
 
 	// broadcast to live dashboard clients
 	h.hub.Broadcast(id, req)
 
-	// create delivery job
-	job, err := h.store.CreateDeliveryJob(r.Context(), req.ID, endpoint.TargetURL)
-	if err != nil {
-		h.logger.Error("CreateDeliveryJob failed", zap.Error(err))
-		// non-critical, webhook is captured regardless
-	} else {
-		// push to fast-path in-memory queue
-		h.queue.Push(*job)
-	}
-
-	h.logger.Info("webhook captured",
-		zap.String("endpoint_id", id.String()),
-		zap.String("method", r.Method),
-	)
+	// h.logger.Info("webhook captured",
+	// 	zap.String("endpoint_id", id.String()),
+	// 	zap.String("method", r.Method),
+	// )
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "captured"})
 }

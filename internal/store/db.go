@@ -17,6 +17,9 @@ func NewPool(dbUrl string) (*pgxpool.Pool, error) {
 	// disable prepared statements for pooled url
 	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 
+	// optimize connection pool for high concurrency
+	config.MaxConns = 200
+
 	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pool: %w", err)
