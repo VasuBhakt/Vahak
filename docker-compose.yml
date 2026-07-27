@@ -38,6 +38,8 @@ services:
       dockerfile: Dockerfile.sink
     ports:
       - "9090:9090"
+    profiles:
+      - test
 
 volumes:
   postgres_data:

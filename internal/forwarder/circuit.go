@@ -11,6 +11,9 @@ const (
 	cbMaxCooldown = 5 * time.Minute   // maximum cooldown cap
 )
 
+// Exported variable so tests can mock time
+var clockNow = time.Now
+
 type circuitState int
 
 const (
@@ -59,7 +62,7 @@ func (cm *CircuitManager) Allow(targetURL string) bool {
 		if cooldown > cbMaxCooldown {
 			cooldown = cbMaxCooldown
 		}
-		if time.Since(cb.lastFailure) > cooldown {
+		if clockNow().Sub(cb.lastFailure) > cooldown {
 			cb.state = circuitHalfOpen
 			return true // allow one probe request
 		}
@@ -86,7 +89,7 @@ func (cm *CircuitManager) RecordFailure(targetURL string) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.failures++
-	cb.lastFailure = time.Now()
+	cb.lastFailure = clockNow()
 
 	if cb.state == circuitHalfOpen {
 		// A probe failed. Increment tripCount and open the circuit again.
