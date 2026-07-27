@@ -15,18 +15,18 @@ Vahak decouples ingestion from delivery to ensure high throughput and backpressu
 
 ```mermaid
 graph TD
-    Client[Client] -->|POST /hooks/{id}| API[API Handler]
+    Client[Client] -->|"POST /hooks/{id}"| API[API Handler]
     API -->|Payload| IngestCh[Ingest Channel]
     
     IngestCh -->|Pull| BatchWorker[Batch Worker]
     BatchWorker -->|Bulk COPY| DB[(PostgreSQL)]
     
-    IngestCh -->|Pull| ForwarderPool[Forwarder Pool (100 Workers)]
+    IngestCh -->|Pull| ForwarderPool["Forwarder Pool (100 Workers)"]
     ForwarderPool -->|Run JS| Goja[Embedded JS VM]
-    Goja -->|Mutated Payload| CircuitBreaker{Circuit Breaker}
+    Goja -->|Mutated Payload| CircuitBreaker{"Circuit Breaker"}
     
     CircuitBreaker -->|Allow| Target[Target Webhook URL]
-    CircuitBreaker -.->|Block / 500 Error| Reschedule[Reschedule in DB]
+    CircuitBreaker -.->|"Block / 500 Error"| Reschedule[Reschedule in DB]
     
     Target -->|200 OK| DeliveryCh[Delivered Channel]
     DeliveryCh -->|Bulk UPDATE| DB
@@ -51,10 +51,30 @@ graph TD
 
 Because Vahak is designed to max out a single machine, these benchmarks were run locally using `hey` within a Linux Docker environment (to bypass Windows TCP proxy bottlenecks):
 
-- **Ingestion & Delivery:** ~3,606 Requests Per Second
+- **Ingestion & Delivery:** 3,500 Requests Per Second (**300 million webhooks/day** on a single node)
 - **Payload:** 22 bytes (`{"event": "load.test"}`)
 - **Concurrency:** 500 simultaneous connections
 - **Database Limits:** PostgreSQL tuned with `max_connections=250`.
+
+**To reproduce the benchmark yourself:**
+```bash
+# 1. Start Vahak with the test sink
+docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d
+
+# 2. Create a test endpoint
+curl -X POST -H "Content-Type: application/json" \
+  -H "X-API-Key: docker_test_key" \
+  -d '{"name": "Bench", "target_url": "http://sink:9090"}' \
+  http://localhost:8080/api/endpoints
+
+# 3. Run hey INSIDE the Docker network (replace <UUID> with the returned ID)
+docker run --rm --network vahak_default williamyeh/hey \
+  -n 15000 -c 500 -m POST \
+  -d '{"event": "load.test"}' \
+  -T "application/json" \
+  "http://vahak:8080/hooks/<UUID>"
+```
+> ⚠️ Running `hey` directly from Windows will hit the Docker Desktop TCP proxy bottleneck and produce ~700 RPS. Always benchmark from inside the Docker network.
 
 ## ⚙️ Environment Variables
 
@@ -82,6 +102,16 @@ Vahak is configured via standard environment variables:
    ```bash
    docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d
    ```
+
+### ☁️ Connecting to a Cloud Database (NeonDB, RDS)
+
+Vahak works seamlessly with managed cloud databases. Since Docker containers have automatic outbound internet access, Vahak can connect directly to your remote database using the URL you provide in your `.env` file.
+
+**Important:** If you use a cloud database, you no longer need the local PostgreSQL container. To deploy properly:
+1. Open `docker-compose.yml`.
+2. Delete the entire `db:` service block.
+3. Delete the `depends_on: db` block from the `vahak` service (otherwise Docker will refuse to start Vahak since it's waiting for the local DB).
+4. Run `docker compose up -d` to spin up just the Vahak engine!
 
 2. **Register an Endpoint:**
    ```bash
@@ -112,7 +142,7 @@ go test -v -race ./...
 
 ## 🛠️ Development
 
-- **Language:** Go 1.22+
+- **Language:** Go 1.26+
 - **Database:** PostgreSQL 16
 - **Routing:** `go-chi/chi`
 - **JS Runtime:** `dop251/goja`
