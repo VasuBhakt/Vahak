@@ -9,6 +9,7 @@ import (
 
 	"github.com/VasuBhakt/vahak/internal/models"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -215,4 +216,142 @@ func (s *Store) UpdateJobStatus(ctx context.Context, id uuid.UUID, status string
 		return fmt.Errorf("UpdateJobStatus: %w", err)
 	}
 	return nil
+}
+
+// BatchMarkDelivered bulk-updates a list of jobs to status='delivered' in a single query.
+// This replaces N individual UPDATE statements with one, eliminating table lock contention
+// against the ingester's CopyFrom operations on the delivery_jobs table.
+func (s *Store) BatchMarkDelivered(ctx context.Context, ids []uuid.UUID) error {
+	now := time.Now()
+	_, err := s.db.Exec(ctx,
+		`UPDATE delivery_jobs
+		 SET status = 'delivered', last_attempt = $1, next_attempt = $1
+		 WHERE id = ANY($2)`,
+		now, ids,
+	)
+	if err != nil {
+		return fmt.Errorf("BatchMarkDelivered: %w", err)
+	}
+	return nil
+}
+
+
+type IngestItem struct {
+	Request *models.Request
+	Job     *models.DeliveryJob
+	Result  chan error
+}
+
+func (s *Store) StartBatchIngester(ctx context.Context) chan *IngestItem {
+	// Buffered channel to hold up to 10k incoming webhooks in memory
+	ingestCh := make(chan *IngestItem, 10000)
+	s.StartBatchWorker(ctx, ingestCh)
+	return ingestCh
+}
+
+// StartBatchWorker starts the background batch flush goroutine against an existing channel.
+// Use this when you need to create the channel before the context is available.
+func (s *Store) StartBatchWorker(ctx context.Context, ingestCh chan *IngestItem) {
+	go s.batchWorker(ctx, ingestCh)
+}
+
+func (s *Store) batchWorker(ctx context.Context, ingestCh <-chan *IngestItem) {
+	var buffer []*IngestItem
+	// flush every 50ms even if we don't reach 500 items
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Graceful shutdown: flush whatever is left in the buffer
+			// so in-flight webhooks are not silently dropped.
+			if len(buffer) > 0 {
+				s.flushBatch(context.Background(), buffer)
+			}
+			return
+		case item := <-ingestCh:
+			buffer = append(buffer, item)
+			if len(buffer) >= 500 {
+				s.flushBatch(ctx, buffer)
+				buffer = nil
+			}
+		case <-ticker.C:
+			if len(buffer) > 0 {
+				s.flushBatch(ctx, buffer)
+				buffer = nil
+			}
+		}
+	}
+}
+
+func (s *Store) flushBatch(ctx context.Context, items []*IngestItem) {
+	// Wrap both CopyFrom calls in a single transaction.
+	// This guarantees atomicity: either BOTH tables get written or NEITHER does.
+	// Without this, a crash between the two CopyFroms would leave orphaned
+	// requests with no delivery job, silently losing webhooks forever.
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		for _, item := range items {
+			item.Result <- fmt.Errorf("begin tx: %w", err)
+		}
+		return
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback(ctx)
+		}
+	}()
+
+	// Bulk insert all requests
+	_, err = tx.CopyFrom(ctx, pgx.Identifier{"requests"},
+		[]string{"id", "endpoint_id", "method", "headers", "body", "source_ip", "received_at"},
+		pgx.CopyFromSlice(len(items), func(i int) ([]any, error) {
+			headersJSON, _ := json.Marshal(items[i].Request.Headers)
+			return []any{
+				items[i].Request.ID,
+				items[i].Request.EndpointID,
+				items[i].Request.Method,
+				string(headersJSON),
+				items[i].Request.Body,
+				items[i].Request.SourceIP,
+				items[i].Request.ReceivedAt,
+			}, nil
+		}),
+	)
+	if err != nil {
+		for _, item := range items {
+			item.Result <- fmt.Errorf("copy requests: %w", err)
+		}
+		return
+	}
+
+	// Bulk insert all delivery jobs
+	_, err = tx.CopyFrom(ctx, pgx.Identifier{"delivery_jobs"},
+		[]string{"id", "request_id", "target_url", "status", "attempts", "last_attempt", "next_attempt", "created_at"},
+		pgx.CopyFromSlice(len(items), func(i int) ([]any, error) {
+			return []any{
+				items[i].Job.ID,
+				items[i].Job.RequestID,
+				items[i].Job.TargetURL,
+				items[i].Job.Status,
+				items[i].Job.Attempts,
+				items[i].Job.LastAttempt,
+				items[i].Job.NextAttempt,
+				items[i].Job.CreatedAt,
+			}, nil
+		}),
+	)
+	if err != nil {
+		for _, item := range items {
+			item.Result <- fmt.Errorf("copy delivery_jobs: %w", err)
+		}
+		return
+	}
+
+	err = tx.Commit(ctx)
+	// Notify all blocked HTTP handlers with the commit result
+	for _, item := range items {
+		item.Result <- err
+	}
 }

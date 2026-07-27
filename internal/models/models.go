@@ -34,4 +34,11 @@ type DeliveryJob struct {
 	LastAttempt *time.Time `json:"last_attempt"`
 	NextAttempt time.Time  `json:"next_attempt"`
 	CreatedAt   time.Time  `json:"created_at"`
+
+	// In-memory only: carried through the fast-path queue to avoid redundant DB reads.
+	// Tagged json:"-" so they are never serialised or persisted.
+	InMemMethod            string      `json:"-"`
+	InMemHeaders           http.Header `json:"-"`
+	InMemBody              string      `json:"-"`
+	InMemTransformerScript string      `json:"-"`
 }
