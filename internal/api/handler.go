@@ -25,6 +25,11 @@ type Handler struct {
 	resultPool sync.Pool // reuse chan error to reduce GC pressure
 }
 
+type CachedEndpoint struct {
+	ep       *models.Endpoint
+	cachedAt time.Time
+}
+
 func New(store *store.Store, logger *zap.Logger, hub *Hub, jq *queue.JobQueue, ingestCh chan *store.IngestItem) *Handler {
 	h := &Handler{
 		store:    store,
@@ -159,7 +164,10 @@ func (h *Handler) UpdateEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.epCache.Store(id, endpoint)
+	h.epCache.Store(id, &CachedEndpoint{
+		ep:       endpoint,
+		cachedAt: time.Now(),
+	})
 
 	writeJSON(w, http.StatusOK, endpoint)
 }
@@ -213,14 +221,23 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 	// verify endpoint exists
 	var endpoint *models.Endpoint
 	if cached, ok := h.epCache.Load(id); ok {
-		endpoint = cached.(*models.Endpoint)
-	} else {
+		entry := cached.(*CachedEndpoint)
+		if time.Since(entry.cachedAt) < time.Minute {
+			endpoint = entry.ep
+		} else {
+			h.epCache.Delete(id)
+		}
+	}
+	if endpoint == nil {
 		ep, err := h.store.GetEndpoint(r.Context(), id)
 		if err != nil {
 			writeError(w, http.StatusNotFound, "endpoint not found")
 			return
 		}
-		h.epCache.Store(id, ep)
+		h.epCache.Store(id, &CachedEndpoint{
+			ep:       ep,
+			cachedAt: time.Now(),
+		})
 		endpoint = ep
 	}
 
@@ -261,16 +278,16 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 
 	// prepare delivery job - carry request data in-memory to skip DB reads in forwarder
 	job := &models.DeliveryJob{
-		ID:                    uuid.New(),
-		RequestID:             req.ID,
-		TargetURL:             endpoint.TargetURL,
-		Status:                "pending",
-		Attempts:              0,
-		NextAttempt:           time.Now(),
-		CreatedAt:             time.Now(),
-		InMemMethod:           req.Method,
-		InMemHeaders:          headers,
-		InMemBody:             bodyStr,
+		ID:                     uuid.New(),
+		RequestID:              req.ID,
+		TargetURL:              endpoint.TargetURL,
+		Status:                 "pending",
+		Attempts:               0,
+		NextAttempt:            time.Now(),
+		CreatedAt:              time.Now(),
+		InMemMethod:            req.Method,
+		InMemHeaders:           headers,
+		InMemBody:              bodyStr,
 		InMemTransformerScript: endpoint.TransformerScript,
 	}
 
