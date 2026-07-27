@@ -58,6 +58,9 @@ func New(store *store.Store, logger *zap.Logger, jq *queue.JobQueue) *Forwarder 
 			// Safe to dial
 			return dialer.DialContext(ctx, network, addr)
 		},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
 	}
 
 	return &Forwarder{
