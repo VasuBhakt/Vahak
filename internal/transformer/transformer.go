@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/dop251/goja"
 )
@@ -70,6 +71,12 @@ func Transform(script string, payload string) (string, error) {
 		return "", fmt.Errorf("invalid json payload: %w", err)
 	}
 	vm.Set("payload", payloadMap)
+
+	// ensure script doesn't run forever (DoS protection)
+	timer := time.AfterFunc(50*time.Millisecond, func() {
+		vm.Interrupt("execution timeout")
+	})
+	defer timer.Stop()
 
 	// run compiled bytecode
 	val, err := vm.RunProgram(prog)

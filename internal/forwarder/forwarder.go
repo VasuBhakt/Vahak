@@ -3,7 +3,9 @@ package forwarder
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -31,13 +33,40 @@ type Forwarder struct {
 }
 
 func New(store *store.Store, logger *zap.Logger, jq *queue.JobQueue) *Forwarder {
+	// SSRF Protection: custom dialer that blocks private and loopback IPs
+	dialer := &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			for _, ip := range ips {
+				// Block loopback, private networks, and unspecified IPs
+				if ip.IP.IsPrivate() || ip.IP.IsLoopback() || ip.IP.IsUnspecified() {
+					return nil, errors.New("SSRF blocked: private/loopback IP address not allowed")
+				}
+			}
+			// Safe to dial
+			return dialer.DialContext(ctx, network, addr)
+		},
+	}
+
 	return &Forwarder{
 		store:       store,
 		logger:      logger,
 		queue:       jq,
 		deliveredCh: make(chan uuid.UUID, 10000),
 		client: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout:   10 * time.Second,
+			Transport: transport,
 		},
 	}
 }

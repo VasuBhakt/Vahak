@@ -232,8 +232,8 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// limit body size to 1MB
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	// limit body size to 100KB to prevent Memory Exhaustion (OOM) DoS
+	r.Body = http.MaxBytesReader(w, r.Body, 100*1024)
 
 	// read body
 	var bodyStr string
