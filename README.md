@@ -1,42 +1,126 @@
-# Vahak 🦅
+# 🦅 Vahak
 
-Vahak is a webhook gateway and integration engine written in Go. It acts as a buffer between external webhook providers and internal services, providing reliable delivery, payload transformation, and real-time observability.
+Vahak is a high-performance webhook delivery engine written in Go. It handles reliable ingestion, JavaScript payload transformation, and outgoing delivery with a PostgreSQL backing store. 
 
-## 🏗️ Architecture & Features
+Designed for high concurrency and resilience on a **single node**, Vahak utilizes channel-based batching, a bounded worker pool, and circuit breakers to achieve **3,500+ RPS** (Requests Per Second) on standard hardware. By intentionally avoiding distributed systems complexity (like Redis or RabbitMQ), Vahak prioritizes extreme ease of testing, local development, and one-click deployment.
 
-- ⚡ **Hybrid Queue System**: Uses a buffered Go channel (`queue.JobQueue`) for immediate, non-blocking webhook processing. If the channel is full or the server restarts, a background database sweeper picks up pending jobs from PostgreSQL.
-- 🧬 **Embedded JavaScript Transformations**: Evaluates user-defined ECMAScript snippets to transform incoming JSON payloads before forwarding. Implemented using `goja`. Includes two key optimizations:
-  - 🧠 **AST Caching**: Scripts are compiled to machine bytecode (`*goja.Program`) once and cached in a `sync.Map`.
-  - 🏊‍♂️ **VM Pooling**: `goja.Runtime` instances are pooled using a `sync.Pool` to avoid memory allocation overhead during concurrent requests.
-- 🛡️ **Reliability & Backoff**: Failed webhook deliveries are retried using exponential backoff with "Full Jitter" to prevent thundering herd scenarios on target servers.
-- 📡 **Real-Time Observability**: A WebSocket hub broadcasts captured webhooks (`models.Request`) in real-time to connected clients for specific endpoints.
+It is built to be brutally simple and eliminate operational complexity:
+- 📦 **Single Static Binary:** No massive dependency trees, Python environments, or Node.js installations.
+- 🐘 **Zero Message Brokers:** Achieves asynchronous, high-throughput delivery exclusively using Go Channels (in-memory fast path) and PostgreSQL `COPY` batching (persistence). No Redis or RabbitMQ required.
+- 🧬 **Embedded JS Engine:** Payload transformation is executed via an embedded JS VM (`goja`) running directly inside the Go process. No external Lambda functions required.
 
-## 🛠️ Tech Stack
-*   **Language**: Go 1.26
-*   **Database**: PostgreSQL (via `pgxpool` and `golang-migrate`)
-*   **Router**: `go-chi/chi`
-*   **JS Engine**: `github.com/dop251/goja`
-*   **WebSockets**: `gorilla/websocket`
+## 🏗️ Architecture
 
-## 🔌 API Endpoints
+Vahak decouples ingestion from delivery to ensure high throughput and backpressure handling.
 
-### Public
-*   `POST /hooks/{id}` - Capture a webhook payload and push to the processing queue.
+```mermaid
+graph TD
+    Client[Client] -->|"POST /hooks/{id}"| API[API Handler]
+    API -->|Payload| IngestCh[Ingest Channel]
+    
+    IngestCh -->|Pull| BatchWorker[Batch Worker]
+    BatchWorker -->|Bulk COPY| DB[(PostgreSQL)]
+    
+    IngestCh -->|Pull| ForwarderPool["Forwarder Pool (100 Workers)"]
+    ForwarderPool -->|Run JS| Goja[Embedded JS VM]
+    Goja -->|Mutated Payload| CircuitBreaker{"Circuit Breaker"}
+    
+    CircuitBreaker -->|Allow| Target[Target Webhook URL]
+    CircuitBreaker -.->|"Block / 500 Error"| Reschedule[Reschedule in DB]
+    
+    Target -->|200 OK| DeliveryCh[Delivered Channel]
+    DeliveryCh -->|Bulk UPDATE| DB
+```
 
-### Protected (Requires `X-API-Key` header)
-*   `POST /endpoints` - Create a new endpoint (Accepts `name`, `target_url`, and optional `transformer_script`).
-*   `GET /endpoints` - List all configured endpoints.
-*   `GET /endpoints/{id}` - Get details for a specific endpoint.
-*   `DELETE /endpoints/{id}` - Delete an endpoint and its cascading data.
-*   `GET /endpoints/{id}/requests` - View historical webhook requests.
-*   `POST /endpoints/{id}/replay/{request_id}` - Enqueue a specific request for replay.
-*   `GET /ws/{id}` - WebSocket upgrade for real-time endpoint logs.
+- 📥 **Fast-Path Ingestion:** Incoming webhooks are pushed into a bounded Go channel (`10,000` capacity) to absorb spikes and apply backpressure to clients.
+- 💾 **Bulk Database Writing:** A background `BatchWorker` uses PostgreSQL's native `COPY` protocol to bulk-insert webhooks, eliminating single-insert transactional overhead.
+- ⚡ **Bounded Delivery Pool:** A fixed pool of 100 goroutines handles outbound HTTP delivery.
+- 🧹 **Batch Status Flusher:** Successful deliveries are flushed to PostgreSQL in bulk (`UPDATE ... WHERE id IN (...)`), significantly reducing table lock contention.
+- 🔄 **DB Sweeper:** A background ticker sweeps the database for pending or failed jobs to ensure at-least-once delivery for jobs that bypassed the in-memory fast path.
+
+## 🛡️ Security & Resilience Features
+
+- 🚫 **SSRF Protection:** A custom HTTP `Transport` strictly blocks outbound connections to private subnets (`10.0.0.0/8`), loopback (`127.0.0.1`), and unspecified IPs.
+- ⏱️ **Infinite Loop DoS Prevention:** JS payload transformations are strictly bounded by a 50ms `time.AfterFunc` interrupt to prevent malicious `while(true)` scripts from starving the worker pool.
+- 🧠 **Memory Exhaustion (OOM) Limits:** Incoming webhook bodies are capped via `http.MaxBytesReader` (100KB limit).
+- 🔌 **Circuit Breaker with Exponential Backoff:** Targets are tracked per-URL. If an endpoint fails 5 consecutive times, the circuit opens. The cooldown scales exponentially (30s, 60s, 120s, up to 5 minutes) before allowing a single probe request.
+- 🌐 **HTTP Connection Pooling:** Aggressive reuse of TCP sockets (`MaxIdleConns: 100`) minimizes TCP handshake overhead on high-frequency targets.
+- ⏱️ **TTL Cache Invalidation:** Target URLs and scripts are cached in-memory with a 60-second TTL to avoid database reads on the fast path.
+
+## 📊 Benchmarks
+
+Because Vahak is designed to max out a single machine, these benchmarks were run locally using `hey` within a Linux Docker environment (to bypass Windows TCP proxy bottlenecks):
+
+- **Ingestion & Delivery:** ~3,606 Requests Per Second
+- **Payload:** 22 bytes (`{"event": "load.test"}`)
+- **Concurrency:** 500 simultaneous connections
+- **Database Limits:** PostgreSQL tuned with `max_connections=250`.
+
+## ⚙️ Environment Variables
+
+Vahak is configured via standard environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PORT` | The port the HTTP API listens on. | `8080` |
+| `DB_URL` | PostgreSQL connection string. | (Required) |
+| `DB_POOL_URL` | Used for `pgxpool` connections. | (Required) |
+| `API_KEY` | Secret key for authenticating `/api/*` endpoints. | (Required) |
 
 ## 🚀 Getting Started
 
-1. Ensure PostgreSQL is running.
-2. Configure your environment variables (Database URL, Port, API Key) in `.env` (or let `config.Load()` use defaults).
-3. Run the server (migrations will apply automatically):
+1. **Start the production stack** (Vahak & PostgreSQL):
+   ```bash
+   docker compose up -d
+   ```
+   *(Optional)* To run the dummy Sink server for benchmarking, attach the test compose file:
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d
+   ```
+
+2. **Register an Endpoint:**
+   ```bash
+   curl -X POST -H "Content-Type: application/json" \
+     -H "X-API-Key: docker_test_key" \
+     -d '{"name": "Test", "target_url": "http://sink:9090"}' \
+     http://localhost:8080/api/endpoints
+   ```
+
+3. **Fire a Webhook:**
+   ```bash
+   # Replace <UUID> with the ID returned from the previous command
+   curl -X POST -H "Content-Type: application/json" \
+     -d '{"msg": "hello"}' \
+     http://localhost:8080/hooks/<UUID>
+   ```
+
+## 🧪 Testing
+
+The codebase includes an automated test suite verifying the circuit breaker state machine, JS execution timeouts, and API routing.
+
+Run the test suite with data race detection:
 ```bash
-go run cmd/server/main.go
+go test -v -race ./...
 ```
+
+*Note: Integration tests in `handler_test.go` require a running PostgreSQL database on `127.0.0.1:5432` with a `vahak` user. They will gracefully `SKIP` if the database is unavailable.*
+
+## 🛠️ Development
+
+- **Language:** Go 1.22+
+- **Database:** PostgreSQL 16
+- **Routing:** `go-chi/chi`
+- **JS Runtime:** `dop251/goja`
+- **Driver:** `jackc/pgx/v5`
+
+## 📜 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE.txt) file for details.
+
+## 🤝 Contributing
+
+**Maintainer** : Swastik Bose (VasuBhakt)
+
+## 🤓 Fun Fact
+
+The inspiration for the name of this project comes from the Sanskrit word **_vahak_**, which means Messenger or Carrier.
