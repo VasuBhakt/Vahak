@@ -29,7 +29,8 @@ type Forwarder struct {
 	client      *http.Client
 	queue       *queue.JobQueue
 	processing  sync.Map
-	deliveredCh chan uuid.UUID // batches successful delivery IDs to reduce DB lock contention
+	deliveredCh chan uuid.UUID      // batches successful delivery IDs to reduce DB lock contention
+	circuits    *CircuitManager     // per-endpoint circuit breaker to avoid hammering dead targets
 }
 
 func New(store *store.Store, logger *zap.Logger, jq *queue.JobQueue) *Forwarder {
@@ -64,6 +65,7 @@ func New(store *store.Store, logger *zap.Logger, jq *queue.JobQueue) *Forwarder 
 		logger:      logger,
 		queue:       jq,
 		deliveredCh: make(chan uuid.UUID, 10000),
+		circuits:    NewCircuitManager(),
 		client: &http.Client{
 			Timeout:   10 * time.Second,
 			Transport: transport,
@@ -202,11 +204,25 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 		finalBody = transformed
 	}
 	req.Body = finalBody
+
+	// circuit breaker: skip delivery if endpoint is consistently failing
+	if !f.circuits.Allow(job.TargetURL) {
+		f.logger.Debug("circuit open, skipping delivery",
+			zap.String("target", job.TargetURL),
+			zap.String("job_id", job.ID.String()),
+		)
+		// reschedule for after cooldown
+		nextAttempt := time.Now().Add(30 * time.Second)
+		f.store.UpdateJobStatus(ctx, job.ID, "pending", job.Attempts, nextAttempt)
+		return
+	}
+
 	// attempt delivery
 	err := f.deliver(job.TargetURL, req)
 	attempts := job.Attempts + 1
 
 	if err == nil {
+		f.circuits.RecordSuccess(job.TargetURL)
 		// success — push to batch flusher instead of individual UPDATE
 		select {
 		case f.deliveredCh <- job.ID:
@@ -218,6 +234,7 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 	}
 
 	// failed attempt
+	f.circuits.RecordFailure(job.TargetURL)
 	f.logger.Warn("delivery attempt failed",
 		zap.String("job_id", job.ID.String()),
 		zap.String("target", job.TargetURL),
