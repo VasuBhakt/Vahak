@@ -22,18 +22,20 @@ const (
 )
 
 type Forwarder struct {
-	store      *store.Store
-	logger     *zap.Logger
-	client     *http.Client
-	queue      *queue.JobQueue
-	processing sync.Map
+	store       *store.Store
+	logger      *zap.Logger
+	client      *http.Client
+	queue       *queue.JobQueue
+	processing  sync.Map
+	deliveredCh chan uuid.UUID // batches successful delivery IDs to reduce DB lock contention
 }
 
 func New(store *store.Store, logger *zap.Logger, jq *queue.JobQueue) *Forwarder {
 	return &Forwarder{
-		store:  store,
-		logger: logger,
-		queue:  jq,
+		store:       store,
+		logger:      logger,
+		queue:       jq,
+		deliveredCh: make(chan uuid.UUID, 10000),
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -42,20 +44,56 @@ func New(store *store.Store, logger *zap.Logger, jq *queue.JobQueue) *Forwarder 
 
 // Start - runs the forwarder loop in the background
 func (f *Forwarder) Start(ctx context.Context) {
-	// 1. Fast-Path Memory Queue Consumer
+	// 1. Fast-Path Memory Queue Consumer (bounded worker pool)
+	f.logger.Info("starting fast-path queue workers", zap.Int("workers", 100))
+	for i := 0; i < 100; i++ {
+		go func(workerID int) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job := <-f.queue.Jobs:
+					f.processJob(ctx, job)
+				}
+			}
+		}(i)
+	}
+
+	// 2. Batch Status Flusher - drains the deliveredCh and bulk-updates DB
+	// This prevents 100 individual UPDATE statements from fighting the ingester's
+	// CopyFrom for table locks on delivery_jobs.
 	go func() {
-		f.logger.Info("fast-path queue consumer started")
+		var ids []uuid.UUID
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		flush := func() {
+			if len(ids) == 0 {
+				return
+			}
+			if err := f.store.BatchMarkDelivered(ctx, ids); err != nil {
+				f.logger.Error("batch mark delivered failed", zap.Error(err))
+			}
+			ids = nil
+		}
+
 		for {
 			select {
 			case <-ctx.Done():
+				flush() // flush whatever is left on shutdown
 				return
-			case job := <-f.queue.Jobs:
-				go f.processJob(ctx, job)
+			case id := <-f.deliveredCh:
+				ids = append(ids, id)
+				if len(ids) >= 200 {
+					flush()
+				}
+			case <-ticker.C:
+				flush()
 			}
 		}
 	}()
 
-	// 2. DB Sweeper Loop (Reliability / Retries)
+	// 3. DB Sweeper Loop (Reliability / Retries)
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -93,48 +131,60 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 	}
 	defer f.processing.Delete(job.ID)
 
-	// get the original request
-	req, err := f.store.GetRequest(ctx, job.RequestID)
-	if err != nil {
-		f.logger.Error("failed to get request for job",
-			zap.String("job_id", job.ID.String()),
-			zap.Error(err),
-		)
-		return
+	// Fast path: request data was carried in-memory from the ingester.
+	// This skips two SELECT queries per delivery (GetRequest + GetEndpoint).
+	// Slow path (DB sweeper retries): InMemBody is empty, so we load from DB.
+	var req *models.Request
+	if job.InMemBody != "" || job.InMemHeaders != nil {
+		req = &models.Request{
+			ID:      job.RequestID,
+			Method:  job.InMemMethod,
+			Headers: job.InMemHeaders,
+			Body:    job.InMemBody,
+		}
+	} else {
+		var err error
+		req, err = f.store.GetRequest(ctx, job.RequestID)
+		if err != nil {
+			f.logger.Error("failed to get request for job",
+				zap.String("job_id", job.ID.String()),
+				zap.Error(err),
+			)
+			return
+		}
 	}
 
-	endpoint, err := f.store.GetEndpoint(ctx, req.EndpointID)
-	if err != nil {
-		f.logger.Error("failed to get endpoint for job",
-			zap.String("job_id", job.ID.String()),
-			zap.Error(err),
-		)
-		return
+	// TransformerScript is also carried in-memory; load from DB only for retries.
+	transformerScript := job.InMemTransformerScript
+	if transformerScript == "" && job.Attempts > 0 {
+		ep, err := f.store.GetEndpoint(ctx, job.RequestID)
+		if err == nil {
+			transformerScript = ep.TransformerScript
+		}
 	}
 
 	finalBody := req.Body
-	if endpoint.TransformerScript != "" {
-		transformed, err := transformer.Transform(endpoint.TransformerScript, req.Body)
+	if transformerScript != "" {
+		transformed, err := transformer.Transform(transformerScript, req.Body)
 		if err != nil {
 			f.logger.Error("transformation failed", zap.Error(err))
 			return
-		} else {
-			finalBody = transformed
 		}
+		finalBody = transformed
 	}
 	req.Body = finalBody
 	// attempt delivery
-	err = f.deliver(job.TargetURL, req)
+	err := f.deliver(job.TargetURL, req)
 	attempts := job.Attempts + 1
 
 	if err == nil {
-		// success
-		f.logger.Info("webhook delivered",
-			zap.String("job_id", job.ID.String()),
-			zap.String("target", job.TargetURL),
-			zap.Int("attempts", attempts),
-		)
-		f.store.UpdateJobStatus(ctx, job.ID, "delivered", attempts, time.Now())
+		// success — push to batch flusher instead of individual UPDATE
+		select {
+		case f.deliveredCh <- job.ID:
+		default:
+			// channel full, fall back to direct update
+			f.store.UpdateJobStatus(ctx, job.ID, "delivered", attempts, time.Now())
+		}
 		return
 	}
 
