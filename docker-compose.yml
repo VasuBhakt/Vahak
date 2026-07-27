@@ -1,0 +1,42 @@
+version: '3.8'
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vahak
+      POSTGRES_PASSWORD: vahak_password
+      POSTGRES_DB: vahak
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vahak -d vahak"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  vahak:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - DB_URL=postgres://vahak:vahak_password@db:5432/vahak?sslmode=disable
+      - DB_POOL_URL=postgres://vahak:vahak_password@db:5432/vahak?sslmode=disable
+      - API_KEY=docker_test_key
+    depends_on:
+      db:
+        condition: service_healthy
+
+  sink:
+    build:
+      context: .
+      dockerfile: Dockerfile.sink
+    ports:
+      - "9090:9090"
+
+volumes:
+  postgres_data:
