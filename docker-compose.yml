@@ -4,9 +4,9 @@ services:
     image: postgres:16-alpine
     command: postgres -c max_connections=250
     environment:
-      POSTGRES_USER: vahak
-      POSTGRES_PASSWORD: vahak_password
-      POSTGRES_DB: vahak
+      POSTGRES_USER: ${POSTGRES_USER:-vahak}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vahak_password}
+      POSTGRES_DB: ${POSTGRES_DB:-vahak}
     ports:
       - "5432:5432"
     volumes:
@@ -24,10 +24,10 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - PORT=8080
-      - DB_URL=postgres://vahak:vahak_password@db:5432/vahak?sslmode=disable
-      - DB_POOL_URL=postgres://vahak:vahak_password@db:5432/vahak?sslmode=disable
-      - API_KEY=docker_test_key
+      - PORT=${PORT:-8080}
+      - DB_URL=${DB_URL:-postgres://vahak:vahak_password@db:5432/vahak?sslmode=disable}
+      - DB_POOL_URL=${DB_POOL_URL:-postgres://vahak:vahak_password@db:5432/vahak?sslmode=disable}
+      - API_KEY=${API_KEY:-docker_test_key}
     depends_on:
       db:
         condition: service_healthy

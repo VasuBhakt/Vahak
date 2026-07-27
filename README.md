@@ -15,18 +15,18 @@ Vahak decouples ingestion from delivery to ensure high throughput and backpressu
 
 ```mermaid
 graph TD
-    Client[Client] -->|"POST /hooks/{id}"| API[API Handler]
+    Client[Client] -->|POST /hooks/{id}| API[API Handler]
     API -->|Payload| IngestCh[Ingest Channel]
     
     IngestCh -->|Pull| BatchWorker[Batch Worker]
     BatchWorker -->|Bulk COPY| DB[(PostgreSQL)]
     
-    IngestCh -->|Pull| ForwarderPool["Forwarder Pool (100 Workers)"]
+    IngestCh -->|Pull| ForwarderPool[Forwarder Pool (100 Workers)]
     ForwarderPool -->|Run JS| Goja[Embedded JS VM]
-    Goja -->|Mutated Payload| CircuitBreaker{"Circuit Breaker"}
+    Goja -->|Mutated Payload| CircuitBreaker{Circuit Breaker}
     
     CircuitBreaker -->|Allow| Target[Target Webhook URL]
-    CircuitBreaker -.->|"Block / 500 Error"| Reschedule[Reschedule in DB]
+    CircuitBreaker -.->|Block / 500 Error| Reschedule[Reschedule in DB]
     
     Target -->|200 OK| DeliveryCh[Delivered Channel]
     DeliveryCh -->|Bulk UPDATE| DB
@@ -69,7 +69,12 @@ Vahak is configured via standard environment variables:
 
 ## 🚀 Getting Started
 
-1. **Start the production stack** (Vahak & PostgreSQL):
+1. **Set up environment variables:**
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Start the production stack** (Vahak & PostgreSQL):
    ```bash
    docker compose up -d
    ```
