@@ -9,6 +9,18 @@ It is built to be brutally simple and eliminate operational complexity:
 - 🐘 **Zero Message Brokers:** Achieves asynchronous, high-throughput delivery exclusively using Go Channels (in-memory fast path) and PostgreSQL `COPY` batching (persistence). No Redis or RabbitMQ required.
 - 🧬 **Embedded JS Engine:** Payload transformation is executed via an embedded JS VM (`goja`) running directly inside the Go process. No external Lambda functions required.
 
+## 🖥️ Built-In React Dashboard
+
+Vahak includes a modern, fully-featured React dashboard embedded directly into the Go binary (using `go:embed`). No external Node.js server or NGINX reverse proxy is required to serve the frontend. 
+
+The dashboard allows you to:
+- Create, manage, and delete Webhook Endpoints.
+- View live ingestion logs and inspect raw JSON payloads.
+- Inject and test custom JavaScript transformer scripts.
+- Replay failed webhook deliveries with a single click.
+
+To access the dashboard, simply navigate to `http://localhost:8080/` in your browser and authenticate using your `API_KEY` set in `.env`.
+
 ## 🏗️ Architecture
 
 Vahak decouples ingestion from delivery to ensure high throughput and backpressure handling.
