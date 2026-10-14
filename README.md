@@ -1,174 +1,290 @@
-# 🦅 Vahak
+# Vahak
 
-Vahak is a high-performance webhook delivery engine written in Go. It handles reliable ingestion, JavaScript payload transformation, and outgoing delivery with a PostgreSQL backing store. 
+Vahak is a high-throughput, single-node webhook ingestion and delivery engine written in Go. It provides at-least-once delivery guarantees, in-process JavaScript payload transformation, and dual-backend persistence (embedded SQLite WAL or PostgreSQL) without external message brokers.
 
-Designed for high concurrency and resilience on a **single node**, Vahak utilizes channel-based batching, a bounded worker pool, and circuit breakers to achieve **3,000+ RPS** (Requests Per Second) on standard hardware. By intentionally avoiding distributed systems complexity (like Redis or RabbitMQ), Vahak prioritizes extreme ease of testing, local development, and one-click deployment.
+---
 
-It is built to be brutally simple and eliminate operational complexity:
-- 📦 **Single Static Binary:** No massive dependency trees, Python environments, or Node.js installations.
-- 🐘 **Zero Message Brokers:** Achieves asynchronous, high-throughput delivery exclusively using Go Channels (in-memory fast path) and PostgreSQL `COPY` batching (persistence). No Redis or RabbitMQ required.
-- 🧬 **Embedded JS Engine:** Payload transformation is executed via an embedded JS VM (`goja`) running directly inside the Go process. No external Lambda functions required.
+<<<<<<< HEAD
+## Technical Architecture
+=======
+## 🏗️ Technical Architecture
+>>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
 
-## 🖥️ Built-In React Dashboard
-
-Vahak includes a modern, fully-featured React dashboard embedded directly into the Go binary (using `go:embed`). No external Node.js server or NGINX reverse proxy is required to serve the frontend. 
-
-The dashboard allows you to:
-- Create, manage, and delete Webhook Endpoints.
-- View live ingestion logs and inspect raw JSON payloads.
-- Inject and test custom JavaScript transformer scripts.
-- Replay failed webhook deliveries with a single click.
-
-To access the dashboard, simply navigate to `http://localhost:8080/` in your browser and authenticate using your `API_KEY` set in `.env`.
-
-## 🏗️ Architecture
-
-Vahak decouples ingestion from delivery to ensure high throughput and backpressure handling.
-
-```mermaid
-graph TD
-    Client[Client] -->|"POST /hooks/{id}"| API[API Handler]
-    API -->|Payload| IngestCh[Ingest Channel]
-    
-    IngestCh -->|Pull| BatchWorker[Batch Worker]
-    BatchWorker -->|Bulk COPY| DB[(PostgreSQL)]
-    
-    IngestCh -->|Pull| ForwarderPool["Forwarder Pool (100 Workers)"]
-    ForwarderPool -->|Run JS| Goja[Embedded JS VM]
-    Goja -->|Mutated Payload| CircuitBreaker{"Circuit Breaker"}
-    
-    CircuitBreaker -->|Allow| Target[Target Webhook URL]
-    CircuitBreaker -.->|"Block / 500 Error"| Reschedule[Reschedule in DB]
-    
-    Target -->|200 OK| DeliveryCh[Delivered Channel]
-    DeliveryCh -->|Bulk UPDATE| DB
+```
+[ HTTP Ingest ]
+      │
+      ▼
+[ Ingest Channel ]  ── (cap: 100,000, non-blocking enqueue, < 0.5ms ACK)
+      │
+      ├──────────────────────────────────────────────┐
+      │ (async batching)                             │ (fast-path delivery)
+      ▼                                              ▼
+[ Batch Flusher ]                              [ Worker Pool (100 goroutines) ]
+      │                                              │
+      │ 50-500 row multi-insert chunks               ├─► [ Goja JS VM (50ms timeout) ]
+      ▼                                              │
+[ Storage Engine ]                                   ▼
+(SQLite WAL / PostgreSQL)                     [ Circuit Breaker ]
+                                                     │
+                                       ┌─────────────┴─────────────┐
+                                       ▼ (2xx OK)                  ▼ (5xx / Timeout / Circuit Open)
+                                 [ Complete ]               [ Save to delivery_jobs ]
+                                                                   │
+                                                                   ▼
+                                                            [ Retry Sweeper ]
+                                                            (30s interval, exponential backoff)
 ```
 
-- 📥 **Fast-Path Ingestion:** Incoming webhooks are pushed into a bounded Go channel (`10,000` capacity) to absorb spikes and apply backpressure to clients.
-- 💾 **Bulk Database Writing:** A background `BatchWorker` uses PostgreSQL's native `COPY` protocol to bulk-insert webhooks, eliminating single-insert transactional overhead.
-- ⚡ **Bounded Delivery Pool:** A fixed pool of 100 goroutines handles outbound HTTP delivery.
-- 🧹 **Batch Status Flusher:** Successful deliveries are flushed to PostgreSQL in bulk (`UPDATE ... WHERE id IN (...)`), significantly reducing table lock contention.
-- 🔄 **DB Sweeper:** A background ticker sweeps the database for pending or failed jobs to ensure at-least-once delivery for jobs that bypassed the in-memory fast path.
+### 1. Ingestion Pipeline
+- **Fast-Path Enqueue:** The HTTP handler decodes the payload, validates the endpoint ID, enqueues to an in-memory buffered channel (`chan *store.IngestItem`, cap: 100,000), and immediately returns `200 OK` (`{"status":"captured"}`) in `< 0.5ms`.
+- **Channel Backpressure:** If ingestion rate exceeds storage write bandwidth and the 100,000-slot buffer fills, the enqueue operation blocks, naturally applying TCP backpressure to upstream webhook senders rather than dropping data or causing out-of-memory (OOM) crashes.
+- **Multi-Row Chunked Flushing:** A dedicated goroutine drains `ingestCh` and batches records into parameter chunks (up to 500 rows per transaction). This reduces database roundtrips by 50x compared to single-row inserts.
 
-## 🛡️ Security & Resilience Features
+### 2. Lock-Free Delivery Mechanics
+- **Fast-Path Bypass:** Outbound HTTP delivery is dispatched immediately from memory. Successful deliveries (`2xx`) never write to the `delivery_jobs` table.
+- **Failure-Only Queueing:** If delivery fails (network partition, 5xx, timeout, or circuit breaker open), the job is committed to `delivery_jobs` with status `pending`, initial `attempts = 1`, and `next_attempt` calculated via exponential backoff. This eliminates 99% of table-lock contention under normal operating conditions.
+- **Indexed Sweeper:** A background ticker sweeps `delivery_jobs` every 30 seconds with bounded pagination (`LIMIT 100`) using a partial index (`WHERE status = 'pending'`).
 
-- 🚫 **SSRF Protection:** A custom HTTP `Transport` strictly blocks outbound connections to private subnets (`10.0.0.0/8`), loopback (`127.0.0.1`), and unspecified IPs.
-- ⏱️ **Infinite Loop DoS Prevention:** JS payload transformations are strictly bounded by a 50ms `time.AfterFunc` interrupt to prevent malicious `while(true)` scripts from starving the worker pool.
-- 🧠 **Memory Exhaustion (OOM) Limits:** Incoming webhook bodies are capped via `http.MaxBytesReader` (100KB limit).
-- 🔌 **Circuit Breaker with Exponential Backoff:** Targets are tracked per-URL. If an endpoint fails 5 consecutive times, the circuit opens. The cooldown scales exponentially (30s, 60s, 120s, up to 5 minutes) before allowing a single probe request.
-- 🌐 **HTTP Connection Pooling:** Aggressive reuse of TCP sockets (`MaxIdleConns: 100`) minimizes TCP handshake overhead on high-frequency targets.
-- ⏱️ **TTL Cache Invalidation:** Target URLs and scripts are cached in-memory with a 60-second TTL to avoid database reads on the fast path.
+### 3. Graceful Drain & Shutdown Lifecycle
+On receiving `SIGINT` or `SIGTERM`:
+1. `http.Server.Shutdown(ctx)` stops accepting new connections and waits for active in-flight requests to complete and enqueue.
+2. Background context is cancelled to stop the ingestion loop.
+3. `batchWorker` drains remaining items in `ingestCh` and executes a final batch flush to disk before releasing the database lock.
+4. Storage engine closes cleanly via `sync.WaitGroup`.
 
-## 📊 Benchmarks
+---
 
-Because Vahak is designed to max out a single machine, these benchmarks were run locally using `hey` within a Linux Docker environment (to bypass Windows TCP proxy bottlenecks):
+<<<<<<< HEAD
+## Storage Engine Implementations
+=======
+## 💾 Storage Engine Implementations
+>>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
 
-- **Ingestion & Delivery:** 3,000 Requests Per Second (**250 million webhooks/day** on a single node)
-- **Payload:** 22 bytes (`{"event": "load.test"}`)
-- **Concurrency:** 500 simultaneous connections
-- **Database Limits:** PostgreSQL tuned with `max_connections=250`.
+Vahak abstracts storage behind a unified Go interface (`store.Storage`), selectable via `DB_ENGINE`:
 
-**To reproduce the benchmark yourself:**
+| Parameter | Embedded SQLite (`DB_ENGINE=sqlite`) | PostgreSQL (`DB_ENGINE=postgres`) |
+|---|---|---|
+| **Driver** | `modernc.org/sqlite` (Pure Go, `CGO_ENABLED=0`) | `jackc/pgx/v5` (`pgxpool`) |
+| **Concurrency Model** | Multi-reader single-writer (WAL mode) | Multi-connection pool (`max_conns=200`) |
+| **Durability Pragma** | `PRAGMA synchronous(NORMAL)` | PostgreSQL WAL defaults |
+| **Write Protocol** | Multi-row parameter batching (`INSERT INTO ... VALUES (?,?), (?,?)...`) | Multi-row batching / `COPY` protocol |
+| **Locking Overhead** | Zero network latency; writer serialized via WAL | TCP roundtrip per transaction |
+| **Pruning Engine** | Hourly `DELETE ... WHERE received_at < NOW() - INTERVAL` | Same |
+
+### SQLite Pragmas
+```sql
+PRAGMA busy_timeout = 5000;
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA wal_autocheckpoint = 10000;
+PRAGMA foreign_keys = ON;
+PRAGMA cache_size = -64000;       -- 64MB memory cache
+PRAGMA temp_store = MEMORY;
+PRAGMA mmap_size = 268435456;     -- 256MB memory-mapped I/O
+```
+
+---
+
+<<<<<<< HEAD
+## Testing Environments: Local vs Docker
+=======
+## 🧪 Testing Environments: Local vs Docker
+>>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
+
+Understanding the difference between the two runtime modes is essential for accurate benchmarking and production deployment.
+
+### 1. Local Testing (Host + Embedded SQLite WAL)
+
+Runs directly on the host machine using embedded SQLite. Eliminates all container and network virtualization overhead.
+
+- **Storage:** Local file (`vahak.db`) in WAL mode.
+- **Network Path:** `Client -> Localhost Kernel Socket -> Vahak (Go runtime) -> In-Memory Channel -> Disk (WAL)`.
+- **Observed Throughput:** **8,500 – 10,200 RPS** at `-c 200`.
+- **Windows Networking Constraint:** On Windows, avoid targeting `localhost` (which triggers IPv6/IPv4 dual-stack resolution delays). Always benchmark against `127.0.0.1`. Keep client concurrency at `c <= 200` to prevent Winsock ephemeral port exhaustion (`connectex refused`).
+
+#### How to Run Locally:
 ```bash
-# 1. Start Vahak with the test sink
-docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d
+# 1. Configure .env for SQLite
+DB_ENGINE=sqlite
+DB_PATH=vahak.db
+PORT=8080
+API_KEY=docker_test_key
+ALLOW_LOCAL_TARGETS=true
 
-# 2. Create a test endpoint
-curl -X POST -H "Content-Type: application/json" \
+# 2. Run
+go run ./cmd/server
+
+# 3. Create Endpoint
+curl -X POST http://127.0.0.1:8080/api/endpoints \
   -H "X-API-Key: docker_test_key" \
-  -d '{"name": "Bench", "target_url": "http://sink:9090"}' \
-  http://localhost:8080/api/endpoints
+  -H "Content-Type: application/json" \
+  -d '{"name":"local-bench","target_url":"http://127.0.0.1:9090"}'
 
-# 3. Run hey INSIDE the Docker network (replace <UUID> with the returned ID)
+# 4. Benchmark
+hey -n 15000 -c 200 -m POST \
+  -d '{"event":"bench"}' \
+  -T "application/json" \
+  "http://127.0.0.1:8080/hooks/<ENDPOINT_UUID>"
+```
+
+---
+
+### 2. Docker Testing (Containerized + PostgreSQL + Sink)
+
+Runs the full distributed architecture across isolated Docker containers:
+- `db`: PostgreSQL 16 Alpine (`max_connections=250`)
+- `vahak`: Compiled static Go binary running against the `db` container
+- `sink`: Mock receiver (`tests/sink/main.go`) listening on `:9090`
+
+- **Storage:** PostgreSQL over Docker bridge network.
+- **Network Path:** `Client -> Docker Proxy -> Vahak Container -> TCP Socket -> PostgreSQL Container`.
+- **Observed Throughput:** **4,000 – 7,000 RPS** at `-c 200`.
+- **Windows Docker Desktop Constraint:** On Windows, Docker runs inside a WSL2 VM. Requests forwarded through `127.0.0.1:8080` pass through `docker-proxy.exe`. At high concurrency (`-c 500`), the Windows userspace TCP proxy listen backlog (128) saturates, triggering `dial tcp 127.0.0.1:8080: connectex: No connection could be made because the target machine actively refused it`.
+- **Accurate High-Concurrency Docker Benchmarking:** To benchmark above 200 concurrency without hitting the Windows host TCP proxy limit, execute `hey` directly **inside** the Docker bridge network:
+
+```bash
+# Run hey inside the Docker network (bypasses Windows docker-proxy)
 docker run --rm --network vahak_default williamyeh/hey \
   -n 15000 -c 500 -m POST \
-  -d '{"event": "load.test"}' \
+  -d '{"event":"docker.bench"}' \
   -T "application/json" \
-  "http://vahak:8080/hooks/<UUID>"
+  "http://vahak:8080/hooks/<ENDPOINT_UUID>"
 ```
-> ⚠️ Running `hey` directly from Windows will hit the Docker Desktop TCP proxy bottleneck and produce ~700 RPS. Always benchmark from inside the Docker network.
 
-## ⚙️ Environment Variables
-
-Vahak is configured via standard environment variables:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PORT` | The port the HTTP API listens on. | `8080` |
-| `DB_URL` | PostgreSQL connection string. | (Required) |
-| `DB_POOL_URL` | Used for `pgxpool` connections. | (Required) |
-| `API_KEY` | Secret key for authenticating `/api/*` endpoints. | (Required) |
-| `ALLOW_LOCAL_TARGETS` | Set to `true` to disable SSRF protection for local testing/internal networks. | `false` |
-
-## 🚀 Getting Started
-
-1. **Set up environment variables:**
-   ```bash
-   cp .env.example .env
-   ```
-
-2. **Start the production stack** (Vahak & PostgreSQL):
-   ```bash
-   docker compose up -d
-   ```
-   *(Optional)* To run the dummy Sink server for benchmarking, attach the test compose file:
-   ```bash
-   docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d
-   ```
-
-### ☁️ Connecting to a Cloud Database (NeonDB, RDS)
-
-Vahak works seamlessly with managed cloud databases. Since Docker containers have automatic outbound internet access, Vahak can connect directly to your remote database using the URL you provide in your `.env` file.
-
-**Important:** If you use a cloud database, you no longer need the local PostgreSQL container. To deploy properly:
-1. Open `docker-compose.yml`.
-2. Delete the entire `db:` service block.
-3. Delete the `depends_on: db` block from the `vahak` service (otherwise Docker will refuse to start Vahak since it's waiting for the local DB).
-4. Run `docker compose up -d` to spin up just the Vahak engine!
-
-2. **Register an Endpoint:**
-   ```bash
-   curl -X POST -H "Content-Type: application/json" \
-     -H "X-API-Key: docker_test_key" \
-     -d '{"name": "Test", "target_url": "http://sink:9090"}' \
-     http://localhost:8080/api/endpoints
-   ```
-
-3. **Fire a Webhook:**
-   ```bash
-   # Replace <UUID> with the ID returned from the previous command
-   curl -X POST -H "Content-Type: application/json" \
-     -d '{"msg": "hello"}' \
-     http://localhost:8080/hooks/<UUID>
-   ```
-
-## 🧪 Testing
-
-The codebase includes an automated test suite verifying the circuit breaker state machine, JS execution timeouts, and API routing.
-
-Run the test suite with data race detection:
+#### How to Run Docker Stack:
 ```bash
-go test -v -race ./...
+# Start Postgres, Vahak, and Sink
+docker compose -f docker-compose.yml -f docker-compose.test.yml up --build
+
+# In a separate terminal, register an endpoint pointing to the sink container
+curl -X POST http://127.0.0.1:8080/api/endpoints \
+  -H "X-API-Key: docker_test_key" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"docker-test","target_url":"http://sink:9090"}'
+
+# Trigger webhook
+curl -X POST http://127.0.0.1:8080/hooks/<ENDPOINT_UUID> \
+  -H "Content-Type: application/json" \
+  -d '{"event":"docker.test"}'
 ```
 
-*Note: Integration tests in `handler_test.go` require a running PostgreSQL database on `127.0.0.1:5432` with a `vahak` user. They will gracefully `SKIP` if the database is unavailable.*
+---
 
-## 🛠️ Development
+<<<<<<< HEAD
+## Benchmark Comparison
+=======
+## 📊 Benchmark Comparison
+>>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
 
-- **Language:** Go 1.26+
-- **Database:** PostgreSQL 16
-- **Routing:** `go-chi/chi`
-- **JS Runtime:** `dop251/goja`
-- **Driver:** `jackc/pgx/v5`
+Tested with 15,000 requests per run:
 
-## 📜 License
+| Metric | Embedded SQLite (Local) | PostgreSQL 16 (Docker) |
+|---|---|---|
+| **Concurrency** | 200 connections | 200 connections |
+| **Throughput** | **9,016 – 10,215 RPS** | **4,000 – 6,888 RPS** |
+| **Average Latency** | 19.2 ms – 21.7 ms | 26.9 ms – 46.0 ms |
+| **P99 Latency** | 39.5 ms – 40.8 ms | 134.9 ms – 1.26 s |
+| **Network Latency to DB** | 0 ms (In-process memory/disk) | Container bridge TCP socket |
+| **Status Codes** | 100% `200 OK` (15,000 / 15,000) | 100% `200 OK` (15,000 / 15,000) |
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE.txt) file for details.
+---
+
+<<<<<<< HEAD
+## Fault Tolerance & Resilience
+=======
+## 🛡️ Fault Tolerance & Resilience
+>>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
+
+- **SSRF Mitigation:** Outbound deliveries are validated against private IP ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, loopback). Blocked unless `ALLOW_LOCAL_TARGETS=true`.
+- **CPU Starvation Protection:** User-defined JavaScript transformations running in the embedded `goja` runtime are wrapped with a `time.AfterFunc` watchdog terminating execution after 50ms to prevent `while(true)` denial-of-service.
+- **Circuit Breaker State Machine:** Tracks failure states per target host. 5 consecutive delivery failures trip the circuit breaker into `Open` state. Requests during cooldown are rescheduled to `delivery_jobs` without firing outbound TCP calls. Cooldown scales exponentially (30s, 60s, 120s, up to 5m) before moving to `Half-Open` for single-probe verification.
+- **Bounded Retention:** Background worker executes hourly pruning of records where `received_at < NOW() - INTERVAL 'RETENTION_DAYS'` to enforce fixed storage ceilings.
+<<<<<<< HEAD
+=======
+
+---
+
+## ⚙️ Configuration
+
+| Environment Variable | Description | Default |
+|---|---|---|
+| `PORT` | HTTP server listen port | `8080` |
+| `DB_ENGINE` | Persistence driver: `sqlite` or `postgres` | `sqlite` |
+| `DB_PATH` | Path to SQLite file (when `DB_ENGINE=sqlite`) | `vahak.db` |
+| `DB_URL` | PostgreSQL connection string | `""` |
+| `DB_POOL_URL` | PostgreSQL connection pool URL (falls back to `DB_URL`) | `""` |
+| `API_KEY` | Bearer token for protected `/api/*` endpoints | `docker_test_key` |
+| `ALLOW_LOCAL_TARGETS` | Permit delivery to private/loopback IPs | `false` |
+| `RETENTION_DAYS` | Storage TTL in days for requests table | `7` |
+
+---
+
+## 🔬 Test Suite
+
+```bash
+# Unit & integration tests
+go test -v ./...
+
+# Race condition detection
+go test -race ./...
+```
+
+---
+>>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
+
+---
+
+<<<<<<< HEAD
+## Configuration
+
+| Environment Variable | Description | Default |
+|---|---|---|
+| `PORT` | HTTP server listen port | `8080` |
+| `DB_ENGINE` | Persistence driver: `sqlite` or `postgres` | `sqlite` |
+| `DB_PATH` | Path to SQLite file (when `DB_ENGINE=sqlite`) | `vahak.db` |
+| `DB_URL` | PostgreSQL connection string | `""` |
+| `DB_POOL_URL` | PostgreSQL connection pool URL (falls back to `DB_URL`) | `""` |
+| `API_KEY` | Bearer token for protected `/api/*` endpoints | `docker_test_key` |
+| `ALLOW_LOCAL_TARGETS` | Permit delivery to private/loopback IPs | `false` |
+| `RETENTION_DAYS` | Storage TTL in days for requests table | `7` |
+
+---
+
+## Test Suite
+
+```bash
+# Unit & integration tests
+go test -v ./...
+
+# Race condition detection
+go test -race ./...
+```
+
+---
+
+## License
+
+MIT License. See [LICENSE.txt](LICENSE.txt).
+=======
+The name **Vahak** (*वाहक*) is derived from Sanskrit, meaning *Carrier*, *Bearer*, or *Messenger* — historically referring to one who reliably delivers a message across distances without faltering.
+
+---
 
 ## 🤝 Contributing
 
-**Maintainer** : Swastik Bose (VasuBhakt)
+Contributions, issues, and feature requests are welcome!
 
-## 🤓 Fun Fact
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feat/your-feature`)
+3. Commit your changes (`git commit -m 'feat: add some feature'`)
+4. Push to the branch (`git push origin feat/your-feature`)
+5. Open a Pull Request
 
-The inspiration for the name of this project comes from the Sanskrit word **_vahak_**, which means Messenger or Carrier.
+**Maintainer**: [Swastik Bose (VasuBhakt)](https://github.com/VasuBhakt)
+
+---
+
+## 📜 License
+
+Distributed under the MIT License. See [LICENSE.txt](LICENSE.txt) for details.
+>>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
