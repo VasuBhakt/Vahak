@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/VasuBhakt/vahak/internal/models"
@@ -14,7 +15,8 @@ import (
 )
 
 type Store struct {
-	db *pgxpool.Pool
+	db      *pgxpool.Pool
+	batchWg sync.WaitGroup
 }
 
 func New(pool *pgxpool.Pool) *Store {
@@ -259,10 +261,12 @@ func (s *Store) StartBatchIngester(ctx context.Context) chan *IngestItem {
 	return ingestCh
 }
 
-// StartBatchWorker starts the background batch flush goroutine against an existing channel.
-// Use this when you need to create the channel before the context is available.
 func (s *Store) StartBatchWorker(ctx context.Context, ingestCh chan *IngestItem) {
-	go s.batchWorker(ctx, ingestCh)
+	s.batchWg.Add(1)
+	go func() {
+		defer s.batchWg.Done()
+		s.batchWorker(ctx, ingestCh)
+	}()
 }
 
 func (s *Store) batchWorker(ctx context.Context, ingestCh <-chan *IngestItem) {
@@ -274,12 +278,22 @@ func (s *Store) batchWorker(ctx context.Context, ingestCh <-chan *IngestItem) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Graceful shutdown: flush whatever is left in the buffer
-			// so in-flight webhooks are not silently dropped.
-			if len(buffer) > 0 {
-				s.flushBatch(context.Background(), buffer)
+			// Graceful shutdown: drain any remaining items in ingestCh
+			for {
+				select {
+				case item := <-ingestCh:
+					buffer = append(buffer, item)
+					if len(buffer) >= 500 {
+						s.flushBatch(context.Background(), buffer)
+						buffer = nil
+					}
+				default:
+					if len(buffer) > 0 {
+						s.flushBatch(context.Background(), buffer)
+					}
+					return
+				}
 			}
-			return
 		case item := <-ingestCh:
 			buffer = append(buffer, item)
 			if len(buffer) >= 500 {
@@ -293,6 +307,12 @@ func (s *Store) batchWorker(ctx context.Context, ingestCh <-chan *IngestItem) {
 			}
 		}
 	}
+}
+
+func (s *Store) Close() error {
+	s.batchWg.Wait()
+	s.db.Close()
+	return nil
 }
 
 func (s *Store) flushBatch(ctx context.Context, items []*IngestItem) {
@@ -405,10 +425,5 @@ func (s *Store) PruneExpired(ctx context.Context, retentionDays int) error {
 	if err != nil {
 		return fmt.Errorf("PruneExpired delivery_jobs: %w", err)
 	}
-	return nil
-}
-
-func (s *Store) Close() error {
-	s.db.Close()
 	return nil
 }

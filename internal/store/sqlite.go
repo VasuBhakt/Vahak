@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/VasuBhakt/vahak/internal/models"
@@ -15,7 +16,8 @@ import (
 )
 
 type SQLiteStore struct {
-	db *sql.DB
+	db      *sql.DB
+	batchWg sync.WaitGroup
 }
 
 func NewSQLite(dbPath string) (*SQLiteStore, error) {
@@ -23,7 +25,7 @@ func NewSQLite(dbPath string) (*SQLiteStore, error) {
 		dbPath = "vahak.db"
 	}
 
-	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(OFF)&_pragma=wal_autocheckpoint(10000)&_pragma=foreign_keys(ON)&_pragma=cache_size(-64000)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(268435456)", dbPath)
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(10000)&_pragma=foreign_keys(ON)&_pragma=cache_size(-64000)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(268435456)", dbPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
@@ -90,6 +92,7 @@ func (s *SQLiteStore) initSchema() error {
 }
 
 func (s *SQLiteStore) Close() error {
+	s.batchWg.Wait()
 	return s.db.Close()
 }
 
@@ -344,7 +347,11 @@ func (s *SQLiteStore) BatchMarkDelivered(ctx context.Context, ids []uuid.UUID) e
 }
 
 func (s *SQLiteStore) StartBatchWorker(ctx context.Context, ingestCh chan *IngestItem) {
-	go s.batchWorker(ctx, ingestCh)
+	s.batchWg.Add(1)
+	go func() {
+		defer s.batchWg.Done()
+		s.batchWorker(ctx, ingestCh)
+	}()
 }
 
 func (s *SQLiteStore) batchWorker(ctx context.Context, ingestCh <-chan *IngestItem) {
@@ -355,10 +362,22 @@ func (s *SQLiteStore) batchWorker(ctx context.Context, ingestCh <-chan *IngestIt
 	for {
 		select {
 		case <-ctx.Done():
-			if len(buffer) > 0 {
-				s.flushBatch(context.Background(), buffer)
+			// Gracefully drain remaining items from ingestCh before exiting
+			for {
+				select {
+				case item := <-ingestCh:
+					buffer = append(buffer, item)
+					if len(buffer) >= 500 {
+						s.flushBatch(context.Background(), buffer)
+						buffer = nil
+					}
+				default:
+					if len(buffer) > 0 {
+						s.flushBatch(context.Background(), buffer)
+					}
+					return
+				}
 			}
-			return
 		case item := <-ingestCh:
 			buffer = append(buffer, item)
 			if len(buffer) >= 500 {

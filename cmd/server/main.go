@@ -167,11 +167,10 @@ func main() {
 
 	go func() {
 		<-quit
-		logger.Info("shutting down")
-		cancel()
+		logger.Info("shutting down HTTP server...")
 
-		// Create a timeout context for the server shutdown
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Step 1: Stop accepting new HTTP requests and wait for in-flight requests to finish
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 
 		if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -183,4 +182,14 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Fatal("server failed", zap.Error(err))
 	}
+
+	// Step 2: Stop background loops and trigger queue drainage
+	logger.Info("draining queues and background workers...")
+	cancel()
+
+	// Step 3: Close storage engine (waits for batch worker to drain remaining items to disk)
+	if err := st.Close(); err != nil {
+		logger.Error("error closing storage", zap.Error(err))
+	}
+	logger.Info("vahak shutdown complete")
 }
