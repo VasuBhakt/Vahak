@@ -16,13 +16,12 @@ import (
 )
 
 type Handler struct {
-	store      *store.Store
+	store      store.Storage
 	logger     *zap.Logger
 	hub        *Hub
 	queue      *queue.JobQueue
 	epCache    sync.Map
 	ingestCh   chan *store.IngestItem
-	resultPool sync.Pool // reuse chan error to reduce GC pressure
 }
 
 type CachedEndpoint struct {
@@ -30,21 +29,14 @@ type CachedEndpoint struct {
 	cachedAt time.Time
 }
 
-func New(store *store.Store, logger *zap.Logger, hub *Hub, jq *queue.JobQueue, ingestCh chan *store.IngestItem) *Handler {
-	h := &Handler{
+func New(store store.Storage, logger *zap.Logger, hub *Hub, jq *queue.JobQueue, ingestCh chan *store.IngestItem) *Handler {
+	return &Handler{
 		store:    store,
 		logger:   logger,
 		hub:      hub,
 		queue:    jq,
 		ingestCh: ingestCh,
 	}
-	h.resultPool = sync.Pool{
-		New: func() any {
-			ch := make(chan error, 1)
-			return ch
-		},
-	}
-	return h
 }
 
 // helpers
@@ -291,44 +283,25 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 		InMemTransformerScript: endpoint.TransformerScript,
 	}
 
-	// acquire a result channel from the pool
-	resultCh := h.resultPool.Get().(chan error)
 	item := &store.IngestItem{
 		Request: req,
 		Job:     job,
-		Result:  resultCh,
 	}
 
-	// push to batcher memory queue with a timeout.
-	// If the queue is full (system overloaded or postgres down), we return 503
-	// immediately rather than blocking the HTTP connection indefinitely.
+	// push to batcher memory queue with a backpressure timeout.
+	// If the queue is full, we return 503 rather than holding the connection open.
 	select {
 	case h.ingestCh <- item:
-	case <-time.After(5 * time.Second):
-		h.resultPool.Put(resultCh)
+	case <-time.After(2 * time.Second):
 		writeError(w, http.StatusServiceUnavailable, "system overloaded, try again later")
 		return
 	}
 
-	// block ONLY until the background worker flushes the batch to disk
-	if err := <-resultCh; err != nil {
-		h.resultPool.Put(resultCh)
-		h.logger.Error("Batch ingest failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to save request")
-		return
-	}
-	h.resultPool.Put(resultCh)
-
-	// now push to fast-path in-memory queue for delivery
+	// now push to fast-path in-memory queue for immediate delivery
 	h.queue.Push(*job)
 
 	// broadcast to live dashboard clients
 	h.hub.Broadcast(id, req)
-
-	// h.logger.Info("webhook captured",
-	// 	zap.String("endpoint_id", id.String()),
-	// 	zap.String("method", r.Method),
-	// )
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "captured"})
 }

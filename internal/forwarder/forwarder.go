@@ -24,7 +24,7 @@ const (
 )
 
 type Forwarder struct {
-	store       *store.Store
+	store       store.Storage
 	logger      *zap.Logger
 	client      *http.Client
 	queue       *queue.JobQueue
@@ -33,7 +33,7 @@ type Forwarder struct {
 	circuits    *CircuitManager     // per-endpoint circuit breaker to avoid hammering dead targets
 }
 
-func New(store *store.Store, logger *zap.Logger, jq *queue.JobQueue, allowLocal bool) *Forwarder {
+func New(store store.Storage, logger *zap.Logger, jq *queue.JobQueue, allowLocal bool) *Forwarder {
 	// SSRF Protection: custom dialer that blocks private and loopback IPs
 	dialer := &net.Dialer{
 		Timeout:   5 * time.Second,
@@ -221,8 +221,9 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 			zap.String("job_id", job.ID.String()),
 		)
 		// reschedule for after cooldown
-		nextAttempt := time.Now().Add(30 * time.Second)
-		f.store.UpdateJobStatus(ctx, job.ID, "pending", job.Attempts, nextAttempt)
+		job.Status = "pending"
+		job.NextAttempt = time.Now().Add(30 * time.Second)
+		_ = f.store.SaveDeliveryJob(ctx, &job)
 		return
 	}
 
@@ -232,12 +233,13 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 
 	if err == nil {
 		f.circuits.RecordSuccess(job.TargetURL)
-		// success — push to batch flusher instead of individual UPDATE
-		select {
-		case f.deliveredCh <- job.ID:
-		default:
-			// channel full, fall back to direct update
-			f.store.UpdateJobStatus(ctx, job.ID, "delivered", attempts, time.Now())
+		// Only retrying jobs (Attempts > 0) need cleanup in delivery_jobs table
+		if job.Attempts > 0 {
+			select {
+			case f.deliveredCh <- job.ID:
+			default:
+				_ = f.store.BatchMarkDelivered(ctx, []uuid.UUID{job.ID})
+			}
 		}
 		return
 	}
@@ -251,21 +253,26 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 		zap.Error(err),
 	)
 
+	job.Attempts = attempts
+	now := time.Now()
+	job.LastAttempt = &now
+
 	if attempts >= MaxAttempts {
-		// give up
+		job.Status = "failed"
 		f.logger.Error("delivery failed after maximum attempts, marking job as failed",
 			zap.String("job_id", job.ID.String()),
 		)
-		f.store.UpdateJobStatus(ctx, job.ID, "failed", attempts, time.Now())
+		_ = f.store.SaveDeliveryJob(ctx, &job)
 		return
 	}
 
 	// schedule next retry with exponential backoff
-	nextAttempt := CalculateNextAttempt(attempts)
-	f.store.UpdateJobStatus(ctx, job.ID, "pending", attempts, nextAttempt)
+	job.Status = "pending"
+	job.NextAttempt = CalculateNextAttempt(attempts)
+	_ = f.store.SaveDeliveryJob(ctx, &job)
 	f.logger.Info("retry scheduled",
 		zap.String("job_id", job.ID.String()),
-		zap.Time("next_attempt", nextAttempt),
+		zap.Time("next_attempt", job.NextAttempt),
 	)
 }
 
