@@ -1,14 +1,10 @@
-# Vahak
+# 🦅 Vahak
 
 Vahak is a high-throughput, single-node webhook ingestion and delivery engine written in Go. It provides at-least-once delivery guarantees, in-process JavaScript payload transformation, and dual-backend persistence (embedded SQLite WAL or PostgreSQL) without external message brokers.
 
 ---
 
-<<<<<<< HEAD
-## Technical Architecture
-=======
 ## 🏗️ Technical Architecture
->>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
 
 ```
 [ HTTP Ingest ]
@@ -54,11 +50,7 @@ On receiving `SIGINT` or `SIGTERM`:
 
 ---
 
-<<<<<<< HEAD
-## Storage Engine Implementations
-=======
 ## 💾 Storage Engine Implementations
->>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
 
 Vahak abstracts storage behind a unified Go interface (`store.Storage`), selectable via `DB_ENGINE`:
 
@@ -85,11 +77,7 @@ PRAGMA mmap_size = 268435456;     -- 256MB memory-mapped I/O
 
 ---
 
-<<<<<<< HEAD
-## Testing Environments: Local vs Docker
-=======
 ## 🧪 Testing Environments: Local vs Docker
->>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
 
 Understanding the difference between the two runtime modes is essential for accurate benchmarking and production deployment.
 
@@ -170,11 +158,7 @@ curl -X POST http://127.0.0.1:8080/hooks/<ENDPOINT_UUID> \
 
 ---
 
-<<<<<<< HEAD
-## Benchmark Comparison
-=======
 ## 📊 Benchmark Comparison
->>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
 
 Tested with 15,000 requests per run:
 
@@ -189,18 +173,12 @@ Tested with 15,000 requests per run:
 
 ---
 
-<<<<<<< HEAD
-## Fault Tolerance & Resilience
-=======
 ## 🛡️ Fault Tolerance & Resilience
->>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
 
 - **SSRF Mitigation:** Outbound deliveries are validated against private IP ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, loopback). Blocked unless `ALLOW_LOCAL_TARGETS=true`.
 - **CPU Starvation Protection:** User-defined JavaScript transformations running in the embedded `goja` runtime are wrapped with a `time.AfterFunc` watchdog terminating execution after 50ms to prevent `while(true)` denial-of-service.
 - **Circuit Breaker State Machine:** Tracks failure states per target host. 5 consecutive delivery failures trip the circuit breaker into `Open` state. Requests during cooldown are rescheduled to `delivery_jobs` without firing outbound TCP calls. Cooldown scales exponentially (30s, 60s, 120s, up to 5m) before moving to `Half-Open` for single-probe verification.
 - **Bounded Retention:** Background worker executes hourly pruning of records where `received_at < NOW() - INTERVAL 'RETENTION_DAYS'` to enforce fixed storage ceilings.
-<<<<<<< HEAD
-=======
 
 ---
 
@@ -230,42 +208,9 @@ go test -race ./...
 ```
 
 ---
->>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
 
----
+## 🤓 Fun Fact
 
-<<<<<<< HEAD
-## Configuration
-
-| Environment Variable | Description | Default |
-|---|---|---|
-| `PORT` | HTTP server listen port | `8080` |
-| `DB_ENGINE` | Persistence driver: `sqlite` or `postgres` | `sqlite` |
-| `DB_PATH` | Path to SQLite file (when `DB_ENGINE=sqlite`) | `vahak.db` |
-| `DB_URL` | PostgreSQL connection string | `""` |
-| `DB_POOL_URL` | PostgreSQL connection pool URL (falls back to `DB_URL`) | `""` |
-| `API_KEY` | Bearer token for protected `/api/*` endpoints | `docker_test_key` |
-| `ALLOW_LOCAL_TARGETS` | Permit delivery to private/loopback IPs | `false` |
-| `RETENTION_DAYS` | Storage TTL in days for requests table | `7` |
-
----
-
-## Test Suite
-
-```bash
-# Unit & integration tests
-go test -v ./...
-
-# Race condition detection
-go test -race ./...
-```
-
----
-
-## License
-
-MIT License. See [LICENSE.txt](LICENSE.txt).
-=======
 The name **Vahak** (*वाहक*) is derived from Sanskrit, meaning *Carrier*, *Bearer*, or *Messenger* — historically referring to one who reliably delivers a message across distances without faltering.
 
 ---
@@ -287,4 +232,3 @@ Contributions, issues, and feature requests are welcome!
 ## 📜 License
 
 Distributed under the MIT License. See [LICENSE.txt](LICENSE.txt) for details.
->>>>>>> bdb8c68 (docs: overhaul architecture, benchmarks, and dual-engine testing guide)
