@@ -50,23 +50,33 @@ func main() {
 	}
 	defer logger.Sync()
 
-	// init db pool
-	pool, err := store.NewPool(cfg.DBPoolUrl)
-	if err != nil {
-		logger.Fatal("failed to init db pool", zap.Error(err))
+	var st store.Storage
+	if cfg.DBEngine == "sqlite" {
+		sqliteStore, err := store.NewSQLite(cfg.DBPath)
+		if err != nil {
+			logger.Fatal("failed to init sqlite store", zap.Error(err))
+		}
+		defer sqliteStore.Close()
+		st = sqliteStore
+		logger.Info("connected to embedded SQLite database", zap.String("path", cfg.DBPath))
+	} else {
+		// init db pool
+		pool, err := store.NewPool(cfg.DBPoolUrl)
+		if err != nil {
+			logger.Fatal("failed to init db pool", zap.Error(err))
+		}
+		defer pool.Close()
+		logger.Info("connected to postgres database")
+
+		runMigrations(cfg.DBUrl, logger)
+
+		st = store.New(pool)
 	}
-	defer pool.Close()
-	logger.Info("connected to database")
-
-	runMigrations(cfg.DBUrl, logger)
-
-	// init store
-	st := store.New(pool)
 
 	// init hub and queue
 	hub := api.NewHub()
-	jq := queue.NewJobQueue(10000)
-	ingestCh := make(chan *store.IngestItem, 10000)
+	jq := queue.NewJobQueue(20000)
+	ingestCh := make(chan *store.IngestItem, 20000)
 
 	h := api.New(st, logger, hub, jq, ingestCh)
 
@@ -125,6 +135,24 @@ func main() {
 	// start forwarder
 	fwd := forwarder.New(st, logger, jq, cfg.AllowLocalTargets)
 	fwd.Start(ctx)
+
+	// start automated retention cleaner (runs every hour)
+	if cfg.RetentionDays > 0 {
+		go func() {
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := st.PruneExpired(ctx, cfg.RetentionDays); err != nil {
+						logger.Error("retention pruning failed", zap.Error(err))
+					}
+				}
+			}
+		}()
+	}
 
 	// graceful shutdown
 	quit := make(chan os.Signal, 1)
