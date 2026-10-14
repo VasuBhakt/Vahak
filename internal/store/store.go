@@ -186,7 +186,8 @@ func (s *Store) GetPendingJobs(ctx context.Context) ([]models.DeliveryJob, error
 		`SELECT id, request_id, target_url, status, attempts, last_attempt, next_attempt, created_at
 		 FROM delivery_jobs
 		 WHERE status = 'pending' AND next_attempt <= NOW()
-		 ORDER BY next_attempt ASC`,
+		 ORDER BY next_attempt ASC
+		 LIMIT 100`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("GetPendingJobs: %w", err)

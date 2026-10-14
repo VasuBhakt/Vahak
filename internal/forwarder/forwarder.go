@@ -154,7 +154,13 @@ func (f *Forwarder) processPendingJobs(ctx context.Context) {
 	}
 
 	for _, job := range jobs {
-		go f.processJob(ctx, job)
+		select {
+		case <-ctx.Done():
+			return
+		case f.queue.Jobs <- job:
+		default:
+			go f.processJob(ctx, job)
+		}
 	}
 }
 
@@ -190,8 +196,8 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 
 	// TransformerScript is also carried in-memory; load from DB only for retries.
 	transformerScript := job.InMemTransformerScript
-	if transformerScript == "" && job.Attempts > 0 {
-		ep, err := f.store.GetEndpoint(ctx, job.RequestID)
+	if transformerScript == "" && job.Attempts > 0 && req != nil {
+		ep, err := f.store.GetEndpoint(ctx, req.EndpointID)
 		if err == nil {
 			transformerScript = ep.TransformerScript
 		}
