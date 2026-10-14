@@ -12,3 +12,8 @@
 .idea/
 
 db_sync.go
+
+# SQLite database files
+*.db
+*.db-shm
+*.db-wal

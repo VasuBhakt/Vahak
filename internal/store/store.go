@@ -303,7 +303,9 @@ func (s *Store) flushBatch(ctx context.Context, items []*IngestItem) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		for _, item := range items {
-			item.Result <- fmt.Errorf("begin tx: %w", err)
+			if item.Result != nil {
+				item.Result <- fmt.Errorf("begin tx: %w", err)
+			}
 		}
 		return
 	}
@@ -331,7 +333,9 @@ func (s *Store) flushBatch(ctx context.Context, items []*IngestItem) {
 	)
 	if err != nil {
 		for _, item := range items {
-			item.Result <- fmt.Errorf("copy requests: %w", err)
+			if item.Result != nil {
+				item.Result <- fmt.Errorf("copy requests: %w", err)
+			}
 		}
 		return
 	}
@@ -354,7 +358,9 @@ func (s *Store) flushBatch(ctx context.Context, items []*IngestItem) {
 	)
 	if err != nil {
 		for _, item := range items {
-			item.Result <- fmt.Errorf("copy delivery_jobs: %w", err)
+			if item.Result != nil {
+				item.Result <- fmt.Errorf("copy delivery_jobs: %w", err)
+			}
 		}
 		return
 	}
@@ -362,6 +368,47 @@ func (s *Store) flushBatch(ctx context.Context, items []*IngestItem) {
 	err = tx.Commit(ctx)
 	// Notify all blocked HTTP handlers with the commit result
 	for _, item := range items {
-		item.Result <- err
+		if item.Result != nil {
+			item.Result <- err
+		}
 	}
+}
+
+func (s *Store) SaveDeliveryJob(ctx context.Context, job *models.DeliveryJob) error {
+	now := time.Now()
+	_, err := s.db.Exec(ctx,
+		`INSERT INTO delivery_jobs (id, request_id, target_url, status, attempts, last_attempt, next_attempt, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		 ON CONFLICT(id) DO UPDATE SET
+		   status = EXCLUDED.status,
+		   attempts = EXCLUDED.attempts,
+		   last_attempt = EXCLUDED.last_attempt,
+		   next_attempt = EXCLUDED.next_attempt`,
+		job.ID, job.RequestID, job.TargetURL, job.Status, job.Attempts, job.LastAttempt, job.NextAttempt, now,
+	)
+	if err != nil {
+		return fmt.Errorf("SaveDeliveryJob: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) PruneExpired(ctx context.Context, retentionDays int) error {
+	if retentionDays <= 0 {
+		return nil
+	}
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+	_, err := s.db.Exec(ctx, "DELETE FROM requests WHERE received_at < $1", cutoff)
+	if err != nil {
+		return fmt.Errorf("PruneExpired requests: %w", err)
+	}
+	_, err = s.db.Exec(ctx, "DELETE FROM delivery_jobs WHERE status = 'failed' AND created_at < $1", cutoff)
+	if err != nil {
+		return fmt.Errorf("PruneExpired delivery_jobs: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) Close() error {
+	s.db.Close()
+	return nil
 }
