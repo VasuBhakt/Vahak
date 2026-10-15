@@ -83,38 +83,62 @@ PRAGMA mmap_size = 268435456;     -- 256MB memory-mapped I/O
 
 ---
 
-## 🧪 Testing Environments: Local vs Docker
+## 🚀 Deployment & Operational Modes
 
-### 1. Local Testing (Host + Embedded SQLite WAL)
-Runs directly on the host machine using embedded SQLite:
-- **Storage:** Local file (`vahak.db`) in WAL mode.
-- **Network Path:** `Client -> Localhost Kernel Socket -> Vahak -> Disk (WAL)`.
-- **Windows Networking Note:** Avoid targeting `localhost` on Windows (triggers dual-stack resolution delays). Always benchmark against `127.0.0.1` with concurrency `c <= 200` to prevent Winsock ephemeral port exhaustion (`connectex refused`).
+Vahak is designed around two primary, battle-tested operational patterns:
 
-```bash
-# Configure .env
-DB_ENGINE=sqlite
-ACK_MODE=durable
-API_KEY=your_secure_api_key
-ALLOW_LOCAL_TARGETS=true
+### Mode 1: Pure Local (Zero-Dependency SQLite)
+*Best for: Local development, CI testing, edge gateways, single-node deployments.*
 
-# Run
-go run ./cmd/server
-```
+Runs directly on your host machine as a standalone single binary with zero external dependencies:
+- **Database:** Embedded SQLite (`vahak.db`) running with pure-Go (`CGO_ENABLED=0`) and WAL mode.
+- **Setup:**
+  ```bash
+  # .env configuration
+  DB_ENGINE=sqlite
+  DB_PATH=vahak.db
+  ACK_MODE=durable          # or "fast" for maximum raw throughput
+  API_KEY=your_secure_api_key
+  ALLOW_LOCAL_TARGETS=true
+
+  go run ./cmd/server/main.go
+  ```
 
 ---
 
-### 2. Docker Testing (Containerized + PostgreSQL + Sink)
-Runs the multi-container stack across isolated Docker services:
-- `db`: PostgreSQL 16 Alpine (`max_connections=250`)
-- `vahak`: Compiled static Go binary running against `db`
-- `sink`: Mock receiver (`tests/sink/main.go`) listening on `:9090`
+### Mode 2: Pure Docker Stack (PostgreSQL Cluster)
+*Best for: Production servers, cloud deployments (EC2, Droplets, Kubernetes).*
 
+Runs both Vahak and tuned PostgreSQL 16 containers in an isolated internal Docker network (`vahak_default`), bypassing host OS socket bottlenecks:
+- **Database:** PostgreSQL 16 Alpine with connection pooling (`pgxpool`, `max_connections=250`) and streaming `COPY` protocol micro-batching.
+- **Setup:**
+  ```bash
+  # Start the complete stack
+  docker compose up -d
+
+  # View live logs
+  docker compose logs -f vahak
+  ```
+
+> ⚠️ **Note on Hybrid Setups (Local Host Binary + Docker Postgres):**
+> Running the host binary while pointing `DB_URL` to a containerized Postgres on Windows often encounters host-OS friction (IPv6 `[::1]` resolution conflicts with native Windows services, and bash shell environment shadowing). Use **Mode 1** for local development and **Mode 2** for containerized/production environments.
+
+---
+
+### ⚡ Data Plane Optimizations
+To achieve 10k–30k RPS with sustained stability, Vahak incorporates the following low-level engineering optimizations:
+- **Zero-Contention Data Path:** Chi `middleware.Logger` is strictly scoped to `/api/*` management routes. High-volume `/hooks/*` endpoints bypass synchronous OS console mutexes (`stdout`).
+- **HTTP Transport Keep-Alive Recycling:** Outbound delivery bodies are drained via `io.Copy(io.Discard, resp.Body)` and closed immediately, allowing Go's `http.Transport` connection pool to recycle TCP sockets without exhausting OS ephemeral ports (`connectex`).
+- **Zero-Allocation Channel Timers:** Eliminated per-request `time.After()` heap allocations in webhook capture by utilizing direct non-blocking select sends with reusable fallback timers.
+- **Failure-Only Queueing in Fast Mode:** When `ACK_MODE=fast`, successful deliveries complete in-memory without touching disk; only failed attempts are written to `delivery_jobs` for exponential retry.
+
+---
+
+## 🧪 Benchmarking & Verification
+
+### In-Container Benchmark (Docker Network)
+Benchmark from inside the Docker bridge network to measure pure daemon throughput without host network proxy limits:
 ```bash
-# Start Docker stack
-docker compose -f docker-compose.yml -f docker-compose.test.yml up --build
-
-# Benchmark from INSIDE the Docker bridge network to bypass host proxy limits:
 docker run --rm --network vahak_default williamyeh/hey \
   -n 15000 -c 200 -m POST \
   -d '{"event":"bench"}' \
