@@ -41,4 +41,5 @@ type DeliveryJob struct {
 	InMemHeaders           http.Header `json:"-"`
 	InMemBody              string      `json:"-"`
 	InMemTransformerScript string      `json:"-"`
+	Persisted              bool        `json:"-"` // true if job has already been written to delivery_jobs in DB
 }

@@ -66,7 +66,7 @@ func setupTestHandler(t *testing.T) (*Handler, *store.Store, chan *store.IngestI
 	jq := queue.NewJobQueue(100)
 	ingestCh := make(chan *store.IngestItem, 100)
 
-	h := New(st, logger, hub, jq, ingestCh)
+	h := New(st, logger, hub, jq, ingestCh, "fast")
 	return h, st, ingestCh
 }
 

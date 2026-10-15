@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -49,10 +50,24 @@ func New(store store.Storage, logger *zap.Logger, jq *queue.JobQueue, allowLocal
 			if err != nil {
 				return nil, err
 			}
+			_, cloudMetadataNet, _ := net.ParseCIDR("169.254.0.0/16")
+			_, ipv6LinkLocalNet, _ := net.ParseCIDR("fe80::/10")
+			_, ipv6UniqueLocalNet, _ := net.ParseCIDR("fc00::/7")
+
 			for _, ip := range ips {
-				// Block loopback, private networks, and unspecified IPs
-				if !allowLocal && (ip.IP.IsPrivate() || ip.IP.IsLoopback() || ip.IP.IsUnspecified()) {
-					return nil, errors.New("SSRF blocked: private/loopback IP address not allowed")
+				// Block loopback, private networks, cloud metadata (169.254.0.0/16), and link-local IPv6
+				if !allowLocal {
+					if ip.IP.IsPrivate() ||
+						ip.IP.IsLoopback() ||
+						ip.IP.IsUnspecified() ||
+						ip.IP.IsLinkLocalUnicast() ||
+						ip.IP.IsLinkLocalMulticast() ||
+						ip.IP.IsInterfaceLocalMulticast() ||
+						cloudMetadataNet.Contains(ip.IP) ||
+						ipv6LinkLocalNet.Contains(ip.IP) ||
+						ipv6UniqueLocalNet.Contains(ip.IP) {
+						return nil, errors.New("SSRF blocked: private, loopback, or metadata/link-local IP address not allowed")
+					}
 				}
 			}
 			// Safe to dial
@@ -133,6 +148,8 @@ func (f *Forwarder) Start(ctx context.Context) {
 		defer ticker.Stop()
 
 		f.logger.Info("database sweeper started")
+		// Sweep immediately on startup to recover any pending/in-flight jobs from prior run or crash
+		f.processPendingJobs(ctx)
 
 		for {
 			select {
@@ -154,6 +171,7 @@ func (f *Forwarder) processPendingJobs(ctx context.Context) {
 	}
 
 	for _, job := range jobs {
+		job.Persisted = true
 		select {
 		case <-ctx.Done():
 			return
@@ -194,9 +212,9 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 		}
 	}
 
-	// TransformerScript is also carried in-memory; load from DB only for retries.
+	// TransformerScript is also carried in-memory; load from DB for retries or crash-recovered jobs.
 	transformerScript := job.InMemTransformerScript
-	if transformerScript == "" && job.Attempts > 0 && req != nil {
+	if transformerScript == "" && req != nil {
 		ep, err := f.store.GetEndpoint(ctx, req.EndpointID)
 		if err == nil {
 			transformerScript = ep.TransformerScript
@@ -233,8 +251,7 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 
 	if err == nil {
 		f.circuits.RecordSuccess(job.TargetURL)
-		// Only retrying jobs (Attempts > 0) need cleanup in delivery_jobs table
-		if job.Attempts > 0 {
+		if job.Persisted {
 			select {
 			case f.deliveredCh <- job.ID:
 			default:
@@ -262,6 +279,7 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 		f.logger.Error("delivery failed after maximum attempts, marking job as failed",
 			zap.String("job_id", job.ID.String()),
 		)
+		job.Persisted = true
 		_ = f.store.SaveDeliveryJob(ctx, &job)
 		return
 	}
@@ -269,6 +287,7 @@ func (f *Forwarder) processJob(ctx context.Context, job models.DeliveryJob) {
 	// schedule next retry with exponential backoff
 	job.Status = "pending"
 	job.NextAttempt = CalculateNextAttempt(attempts)
+	job.Persisted = true
 	_ = f.store.SaveDeliveryJob(ctx, &job)
 	f.logger.Info("retry scheduled",
 		zap.String("job_id", job.ID.String()),
@@ -303,7 +322,9 @@ func (f *Forwarder) deliver(targetURL string, req *models.Request) error {
 	if err != nil {
 		return fmt.Errorf("reuqet failed: %w", err)
 	}
-	defer resp.Body.Close()
+	// drain body and close so the underlying TCP connection can be reused by http.Transport pool
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 
 	// treat non-2xx as failure
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

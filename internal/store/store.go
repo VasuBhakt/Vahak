@@ -296,10 +296,17 @@ func (s *Store) batchWorker(ctx context.Context, ingestCh <-chan *IngestItem) {
 			}
 		case item := <-ingestCh:
 			buffer = append(buffer, item)
-			if len(buffer) >= 500 {
-				s.flushBatch(ctx, buffer)
-				buffer = nil
+		drain:
+			for len(buffer) < 500 {
+				select {
+				case next := <-ingestCh:
+					buffer = append(buffer, next)
+				default:
+					break drain
+				}
 			}
+			s.flushBatch(ctx, buffer)
+			buffer = nil
 		case <-ticker.C:
 			if len(buffer) > 0 {
 				s.flushBatch(ctx, buffer)
@@ -360,29 +367,38 @@ func (s *Store) flushBatch(ctx context.Context, items []*IngestItem) {
 		return
 	}
 
-	// Bulk insert all delivery jobs
-	_, err = tx.CopyFrom(ctx, pgx.Identifier{"delivery_jobs"},
-		[]string{"id", "request_id", "target_url", "status", "attempts", "last_attempt", "next_attempt", "created_at"},
-		pgx.CopyFromSlice(len(items), func(i int) ([]any, error) {
-			return []any{
-				items[i].Job.ID,
-				items[i].Job.RequestID,
-				items[i].Job.TargetURL,
-				items[i].Job.Status,
-				items[i].Job.Attempts,
-				items[i].Job.LastAttempt,
-				items[i].Job.NextAttempt,
-				items[i].Job.CreatedAt,
-			}, nil
-		}),
-	)
-	if err != nil {
-		for _, item := range items {
-			if item.Result != nil {
-				item.Result <- fmt.Errorf("copy delivery_jobs: %w", err)
-			}
+	// Bulk insert all delivery jobs (if any; fast mode omits jobs on happy path)
+	var validJobs []*models.DeliveryJob
+	for _, item := range items {
+		if item.Job != nil {
+			validJobs = append(validJobs, item.Job)
 		}
-		return
+	}
+
+	if len(validJobs) > 0 {
+		_, err = tx.CopyFrom(ctx, pgx.Identifier{"delivery_jobs"},
+			[]string{"id", "request_id", "target_url", "status", "attempts", "last_attempt", "next_attempt", "created_at"},
+			pgx.CopyFromSlice(len(validJobs), func(i int) ([]any, error) {
+				return []any{
+					validJobs[i].ID,
+					validJobs[i].RequestID,
+					validJobs[i].TargetURL,
+					validJobs[i].Status,
+					validJobs[i].Attempts,
+					validJobs[i].LastAttempt,
+					validJobs[i].NextAttempt,
+					validJobs[i].CreatedAt,
+				}, nil
+			}),
+		)
+		if err != nil {
+			for _, item := range items {
+				if item.Result != nil {
+					item.Result <- fmt.Errorf("copy delivery_jobs: %w", err)
+				}
+			}
+			return
+		}
 	}
 
 	err = tx.Commit(ctx)

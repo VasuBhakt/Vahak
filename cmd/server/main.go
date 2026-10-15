@@ -50,6 +50,16 @@ func main() {
 	}
 	defer logger.Sync()
 
+	// Validate API_KEY at startup
+	if cfg.APIKey == "" {
+		logger.Fatal("startup failed: API_KEY environment variable is required")
+	}
+	if cfg.APIKey == "docker_test_key" && !cfg.AllowInsecureKey {
+		logger.Fatal("startup failed: API_KEY cannot use default 'docker_test_key'. Set a secure API_KEY or set ALLOW_INSECURE_DEFAULT_KEY=true for development/testing")
+	}
+
+	logger.Info("vahak starting", zap.String("engine", cfg.DBEngine), zap.String("ack_mode", cfg.AckMode))
+
 	var st store.Storage
 	if cfg.DBEngine == "sqlite" {
 		sqliteStore, err := store.NewSQLite(cfg.DBPath)
@@ -75,10 +85,10 @@ func main() {
 
 	// init hub and queue
 	hub := api.NewHub()
-	jq := queue.NewJobQueue(20000)
-	ingestCh := make(chan *store.IngestItem, 20000)
+	jq := queue.NewJobQueue(50000)
+	ingestCh := make(chan *store.IngestItem, 50000)
 
-	h := api.New(st, logger, hub, jq, ingestCh)
+	h := api.New(st, logger, hub, jq, ingestCh, cfg.AckMode)
 
 	// middleware for protected routes
 	apiKeyMiddleware := func(next http.Handler) http.Handler {
@@ -94,7 +104,6 @@ func main() {
 
 	// init chi router
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
 	// health check
@@ -108,6 +117,7 @@ func main() {
 
 	// protected
 	r.Route("/api", func(r chi.Router) {
+		r.Use(middleware.Logger)
 		r.Use(apiKeyMiddleware)
 		r.Post("/endpoints", h.CreateEndpoint)
 		r.Get("/endpoints", h.ListEndpoints)

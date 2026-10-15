@@ -332,9 +332,11 @@ func (s *SQLiteStore) BatchMarkDelivered(ctx context.Context, ids []uuid.UUID) e
 		args[i] = id.String()
 	}
 
-	// In SQLite, deleting delivered jobs keeps delivery_jobs near zero rows
-	// and eliminates lock contention against flushBatch!
 	query := fmt.Sprintf(
+		// DELETE keeps delivery_jobs near-zero rows at steady state.
+		// This eliminates B-tree bloat and lock contention between the
+		// sweeper (SELECT pending) and the batch ingester (INSERT new jobs).
+		// Request history is preserved in the requests table.
 		`DELETE FROM delivery_jobs WHERE id IN (%s)`,
 		strings.Join(placeholders, ","),
 	)
@@ -380,10 +382,17 @@ func (s *SQLiteStore) batchWorker(ctx context.Context, ingestCh <-chan *IngestIt
 			}
 		case item := <-ingestCh:
 			buffer = append(buffer, item)
-			if len(buffer) >= 500 {
-				s.flushBatch(ctx, buffer)
-				buffer = nil
+		drain:
+			for len(buffer) < 1000 {
+				select {
+				case next := <-ingestCh:
+					buffer = append(buffer, next)
+				default:
+					break drain
+				}
 			}
+			s.flushBatch(ctx, buffer)
+			buffer = nil
 		case <-ticker.C:
 			if len(buffer) > 0 {
 				s.flushBatch(ctx, buffer)
@@ -450,7 +459,7 @@ func (s *SQLiteStore) flushBatch(ctx context.Context, items []*IngestItem) {
 		}
 	}()
 
-	const chunkSize = 50
+	const chunkSize = 100
 
 	// Insert requests in multi-row chunks (requests-only on fast path)
 	for i := 0; i < len(items); i += chunkSize {
@@ -489,6 +498,50 @@ func (s *SQLiteStore) flushBatch(ctx context.Context, items []*IngestItem) {
 				}
 			}
 			return
+		}
+	}
+
+	// Insert delivery_jobs in multi-row chunks
+	for i := 0; i < len(items); i += chunkSize {
+		end := i + chunkSize
+		if end > len(items) {
+			end = len(items)
+		}
+		chunk := items[i:end]
+
+		jobPlaceholders := make([]string, 0, len(chunk))
+		jobArgs := make([]any, 0, len(chunk)*8)
+
+		for _, item := range chunk {
+			if item.Job == nil {
+				continue
+			}
+			jobPlaceholders = append(jobPlaceholders, "(?, ?, ?, ?, ?, ?, ?, ?)")
+			jobArgs = append(jobArgs,
+				item.Job.ID.String(),
+				item.Job.RequestID.String(),
+				item.Job.TargetURL,
+				item.Job.Status,
+				item.Job.Attempts,
+				nil,
+				item.Job.NextAttempt.UTC(),
+				item.Job.CreatedAt.UTC(),
+			)
+		}
+
+		if len(jobPlaceholders) > 0 {
+			jobQuery := fmt.Sprintf(
+				"INSERT INTO delivery_jobs (id, request_id, target_url, status, attempts, last_attempt, next_attempt, created_at) VALUES %s",
+				strings.Join(jobPlaceholders, ","),
+			)
+			if _, err = tx.ExecContext(ctx, jobQuery, jobArgs...); err != nil {
+				for _, it := range items {
+					if it.Result != nil {
+						it.Result <- fmt.Errorf("exec chunk delivery_jobs: %w", err)
+					}
+				}
+				return
+			}
 		}
 	}
 

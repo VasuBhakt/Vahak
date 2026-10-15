@@ -22,6 +22,8 @@ type Handler struct {
 	queue      *queue.JobQueue
 	epCache    sync.Map
 	ingestCh   chan *store.IngestItem
+	ackMode    string
+	resultPool sync.Pool
 }
 
 type CachedEndpoint struct {
@@ -29,14 +31,24 @@ type CachedEndpoint struct {
 	cachedAt time.Time
 }
 
-func New(store store.Storage, logger *zap.Logger, hub *Hub, jq *queue.JobQueue, ingestCh chan *store.IngestItem) *Handler {
-	return &Handler{
+func New(store store.Storage, logger *zap.Logger, hub *Hub, jq *queue.JobQueue, ingestCh chan *store.IngestItem, ackMode string) *Handler {
+	if ackMode != "fast" {
+		ackMode = "durable"
+	}
+	h := &Handler{
 		store:    store,
 		logger:   logger,
 		hub:      hub,
 		queue:    jq,
 		ingestCh: ingestCh,
+		ackMode:  ackMode,
 	}
+	h.resultPool = sync.Pool{
+		New: func() any {
+			return make(chan error, 1)
+		},
+	}
+	return h
 }
 
 // helpers
@@ -283,27 +295,83 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 		InMemTransformerScript: endpoint.TransformerScript,
 	}
 
-	item := &store.IngestItem{
-		Request: req,
-		Job:     job,
-	}
-
-	// push to batcher memory queue with a backpressure timeout.
-	// If the queue is full, we return 503 rather than holding the connection open.
-	select {
-	case h.ingestCh <- item:
-	case <-time.After(2 * time.Second):
-		writeError(w, http.StatusServiceUnavailable, "system overloaded, try again later")
+	if h.ackMode == "fast" {
+		item := &store.IngestItem{
+			Request: req,
+			Job:     nil, // failure-only queueing: only written to delivery_jobs if delivery fails
+		}
+		select {
+		case h.ingestCh <- item:
+			// fast path: accepted instantly with zero allocations
+		default:
+			// queue is temporarily full: wait with backpressure before rejecting
+			timer := time.NewTimer(500 * time.Millisecond)
+			select {
+			case h.ingestCh <- item:
+				timer.Stop()
+			case <-timer.C:
+				writeError(w, http.StatusServiceUnavailable, "system overloaded, try again later")
+				return
+			case <-r.Context().Done():
+				timer.Stop()
+				return
+			}
+		}
+		// In fast mode: dispatch immediately and return 200 OK
+		h.queue.Push(*job)
+		h.hub.Broadcast(id, req)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"captured"}` + "\n"))
 		return
 	}
 
-	// now push to fast-path in-memory queue for immediate delivery
+	// Durable mode (default): block until batch is committed to durable storage
+	resultCh := h.resultPool.Get().(chan error)
+	item := &store.IngestItem{
+		Request: req,
+		Job:     job,
+		Result:  resultCh,
+	}
+
+	select {
+	case h.ingestCh <- item:
+	default:
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case h.ingestCh <- item:
+			timer.Stop()
+		case <-timer.C:
+			h.resultPool.Put(resultCh)
+			writeError(w, http.StatusServiceUnavailable, "system overloaded, try again later")
+			return
+		case <-r.Context().Done():
+			timer.Stop()
+			h.resultPool.Put(resultCh)
+			return
+		}
+	}
+
+	select {
+	case err := <-resultCh:
+		h.resultPool.Put(resultCh)
+		if err != nil {
+			h.logger.Error("durable batch ingest failed", zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "failed to durably record webhook")
+			return
+		}
+	case <-r.Context().Done():
+		h.resultPool.Put(resultCh)
+		return
+	}
+
+	// Dispatch for delivery ONLY after batch commit has succeeded
+	job.Persisted = true
 	h.queue.Push(*job)
-
-	// broadcast to live dashboard clients
 	h.hub.Broadcast(id, req)
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "captured"})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"captured"}` + "\n"))
 }
 
 // POST /endpoints/{id}/replay/{request_id}
