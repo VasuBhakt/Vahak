@@ -285,10 +285,10 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 		ID:                     uuid.New(),
 		RequestID:              req.ID,
 		TargetURL:              endpoint.TargetURL,
-		Status:                 "pending",
+		Status:                 models.JobStatusPending,
 		Attempts:               0,
-		NextAttempt:            time.Now(),
-		CreatedAt:              time.Now(),
+		NextAttempt:            time.Now().UTC().Add(15 * time.Second),
+		CreatedAt:              time.Now().UTC(),
 		InMemMethod:            req.Method,
 		InMemHeaders:           headers,
 		InMemBody:              bodyStr,
@@ -314,6 +314,7 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 				return
 			case <-r.Context().Done():
 				timer.Stop()
+				writeError(w, http.StatusServiceUnavailable, "request cancelled or timed out")
 				return
 			}
 		}
@@ -348,6 +349,7 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			timer.Stop()
 			h.resultPool.Put(resultCh)
+			writeError(w, http.StatusServiceUnavailable, "request cancelled or timed out")
 			return
 		}
 	}
@@ -362,6 +364,7 @@ func (h *Handler) CaptureWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	case <-r.Context().Done():
 		h.resultPool.Put(resultCh)
+		writeError(w, http.StatusServiceUnavailable, "request cancelled or timed out")
 		return
 	}
 

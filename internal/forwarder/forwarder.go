@@ -144,7 +144,7 @@ func (f *Forwarder) Start(ctx context.Context) {
 
 	// 3. DB Sweeper Loop (Reliability / Retries)
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
 		f.logger.Info("database sweeper started")
@@ -164,20 +164,38 @@ func (f *Forwarder) Start(ctx context.Context) {
 }
 
 func (f *Forwarder) processPendingJobs(ctx context.Context) {
-	jobs, err := f.store.GetPendingJobs(ctx)
-	if err != nil {
-		f.logger.Error("failed to get pending jobs", zap.Error(err))
-		return
-	}
-
-	for _, job := range jobs {
-		job.Persisted = true
+	for {
 		select {
 		case <-ctx.Done():
 			return
-		case f.queue.Jobs <- job:
 		default:
-			go f.processJob(ctx, job)
+		}
+
+		// Atomically claim pending jobs whose lease has expired
+		jobs, err := f.store.ClaimPendingJobs(ctx, 15*time.Second, 100)
+		if err != nil {
+			f.logger.Error("failed to claim pending jobs", zap.Error(err))
+			return
+		}
+
+		if len(jobs) == 0 {
+			return
+		}
+
+		for _, job := range jobs {
+			job.Persisted = true
+			select {
+			case <-ctx.Done():
+				return
+			case f.queue.Jobs <- job:
+			default:
+				go f.processJob(ctx, job)
+			}
+		}
+
+		// If fewer than limit jobs returned, we've drained the backlog
+		if len(jobs) < 100 {
+			return
 		}
 	}
 }
@@ -313,8 +331,9 @@ func (f *Forwarder) deliver(targetURL string, req *models.Request) error {
 		}
 	}
 
-	// add vahak metadata header
-	httpReq.Header.Set("X-Vahak-Delivery", uuid.New().String())
+	// add vahak metadata headers (X-Vahak-Event-ID is stable across retries; X-Vahak-Delivery-ID is unique per attempt)
+	httpReq.Header.Set("X-Vahak-Event-ID", req.ID.String())
+	httpReq.Header.Set("X-Vahak-Delivery-ID", uuid.New().String())
 	httpReq.Header.Set("X-Vahak-Timestamp", time.Now().UTC().Format(time.RFC3339))
 
 	// send
