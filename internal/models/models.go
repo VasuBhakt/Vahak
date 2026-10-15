@@ -7,6 +7,13 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	JobStatusPending   = "pending"
+	JobStatusDelivered = "delivered"
+	JobStatusFailed    = "failed"
+	JobStatusDead      = "dead"
+)
+
 type Endpoint struct {
 	ID                uuid.UUID `json:"id"`
 	Name              string    `json:"name"`

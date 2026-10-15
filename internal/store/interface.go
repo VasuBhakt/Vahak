@@ -25,6 +25,7 @@ type Storage interface {
 	CreateDeliveryJob(ctx context.Context, requestID uuid.UUID, targetURL string) (*models.DeliveryJob, error)
 	SaveDeliveryJob(ctx context.Context, job *models.DeliveryJob) error
 	GetPendingJobs(ctx context.Context) ([]models.DeliveryJob, error)
+	ClaimPendingJobs(ctx context.Context, leaseDuration time.Duration, limit int) ([]models.DeliveryJob, error)
 	UpdateJobStatus(ctx context.Context, id uuid.UUID, status string, attempts int, nextAttempt time.Time) error
 	BatchMarkDelivered(ctx context.Context, ids []uuid.UUID) error
 

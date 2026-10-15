@@ -272,18 +272,28 @@ func (s *SQLiteStore) CreateDeliveryJob(ctx context.Context, requestID uuid.UUID
 	return job, nil
 }
 
-func (s *SQLiteStore) GetPendingJobs(ctx context.Context) ([]models.DeliveryJob, error) {
+func (s *SQLiteStore) ClaimPendingJobs(ctx context.Context, leaseDuration time.Duration, limit int) ([]models.DeliveryJob, error) {
+	if limit <= 0 {
+		limit = 100
+	}
 	now := time.Now().UTC()
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, request_id, target_url, status, attempts, last_attempt, next_attempt, created_at
-		 FROM delivery_jobs
-		 WHERE status = 'pending' AND next_attempt <= ?
-		 ORDER BY next_attempt ASC
-		 LIMIT 100`,
-		now,
-	)
+	leaseUntil := now.Add(leaseDuration)
+
+	// Atomically select and lease the jobs in a single statement using UPDATE ... RETURNING
+	query := fmt.Sprintf(`
+		UPDATE delivery_jobs
+		SET next_attempt = ?
+		WHERE id IN (
+			SELECT id FROM delivery_jobs
+			WHERE status = 'pending' AND next_attempt <= ?
+			ORDER BY next_attempt ASC
+			LIMIT %d
+		)
+		RETURNING id, request_id, target_url, status, attempts, last_attempt, next_attempt, created_at`, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, leaseUntil, now)
 	if err != nil {
-		return nil, fmt.Errorf("GetPendingJobs: %w", err)
+		return nil, fmt.Errorf("ClaimPendingJobs: %w", err)
 	}
 	defer rows.Close()
 
@@ -293,7 +303,7 @@ func (s *SQLiteStore) GetPendingJobs(ctx context.Context) ([]models.DeliveryJob,
 		var idStr, reqIDStr string
 		var lastAttempt sql.NullTime
 		if err := rows.Scan(&idStr, &reqIDStr, &j.TargetURL, &j.Status, &j.Attempts, &lastAttempt, &j.NextAttempt, &j.CreatedAt); err != nil {
-			return nil, fmt.Errorf("GetPendingJobs scan: %w", err)
+			return nil, fmt.Errorf("ClaimPendingJobs scan: %w", err)
 		}
 		j.ID, _ = uuid.Parse(idStr)
 		j.RequestID, _ = uuid.Parse(reqIDStr)
@@ -303,6 +313,10 @@ func (s *SQLiteStore) GetPendingJobs(ctx context.Context) ([]models.DeliveryJob,
 		jobs = append(jobs, j)
 	}
 	return jobs, nil
+}
+
+func (s *SQLiteStore) GetPendingJobs(ctx context.Context) ([]models.DeliveryJob, error) {
+	return s.ClaimPendingJobs(ctx, 15*time.Second, 100)
 }
 
 func (s *SQLiteStore) UpdateJobStatus(ctx context.Context, id uuid.UUID, status string, attempts int, nextAttempt time.Time) error {
@@ -428,11 +442,27 @@ func (s *SQLiteStore) PruneExpired(ctx context.Context, retentionDays int) error
 		return nil
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
-	_, err := s.db.ExecContext(ctx, "DELETE FROM requests WHERE received_at < ?", cutoff)
+
+	// Only delete requests that have NO non-terminal jobs.
+	// If a job is still pending, the request must NOT be pruned, preserving at-least-once delivery.
+	// Fast-mode requests (which have no delivery job row) are safely pruned once expired.
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM requests 
+		WHERE received_at < ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM delivery_jobs j 
+			WHERE j.request_id = requests.id 
+			  AND j.status NOT IN ('delivered', 'failed', 'dead')
+		  )`, cutoff)
 	if err != nil {
 		return fmt.Errorf("PruneExpired requests: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx, "DELETE FROM delivery_jobs WHERE status = 'failed' AND created_at < ?", cutoff)
+
+	// Clean up any remaining terminal jobs older than retention
+	_, err = s.db.ExecContext(ctx, `
+		DELETE FROM delivery_jobs 
+		WHERE status IN ('delivered', 'failed', 'dead') 
+		  AND created_at < ?`, cutoff)
 	if err != nil {
 		return fmt.Errorf("PruneExpired delivery_jobs: %w", err)
 	}
