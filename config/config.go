@@ -9,6 +9,7 @@ import (
 )
 
 type Config struct {
+	AckMode           string // "durable" (default) or "fast"
 	DBEngine          string
 	DBPath            string
 	DBUrl             string
@@ -16,6 +17,7 @@ type Config struct {
 	Port              string
 	APIKey            string
 	AllowLocalTargets bool
+	AllowInsecureKey  bool
 	RetentionDays     int
 }
 
@@ -25,10 +27,16 @@ func Load() *Config {
 		log.Println("no .env file found, reading from environment")
 	}
 
+	ackMode := os.Getenv("ACK_MODE")
+	if ackMode != "fast" {
+		ackMode = "durable"
+	}
+
 	allowLocal := os.Getenv("ALLOW_LOCAL_TARGETS") == "true"
+	allowInsecureKey := os.Getenv("ALLOW_INSECURE_DEFAULT_KEY") == "true"
 	dbUrl := os.Getenv("DB_URL")
 	dbEngine := os.Getenv("DB_ENGINE")
-	if dbEngine == "" {
+	if dbEngine != "postgres" && dbEngine != "sqlite" {
 		if len(dbUrl) >= 8 && (dbUrl[:8] == "postgres" || (len(dbUrl) >= 10 && dbUrl[:10] == "postgresql")) {
 			dbEngine = "postgres"
 		} else {
@@ -53,14 +61,21 @@ func Load() *Config {
 		}
 	}
 
+	dbPoolUrl := os.Getenv("DB_POOL_URL")
+	if dbPoolUrl == "" {
+		dbPoolUrl = dbUrl
+	}
+
 	return &Config{
+		AckMode:           ackMode,
 		DBEngine:          dbEngine,
 		DBPath:            dbPath,
 		DBUrl:             dbUrl,
-		DBPoolUrl:         os.Getenv("DB_POOL_URL"),
+		DBPoolUrl:         dbPoolUrl,
 		Port:              port,
 		APIKey:            os.Getenv("API_KEY"),
 		AllowLocalTargets: allowLocal,
+		AllowInsecureKey:  allowInsecureKey,
 		RetentionDays:     retentionDays,
 	}
 }

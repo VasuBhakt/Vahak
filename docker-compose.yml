@@ -25,9 +25,12 @@ services:
       - "8080:8080"
     environment:
       - PORT=${PORT:-8080}
+      - DB_ENGINE=${DB_ENGINE:-postgres}
       - DB_URL=${DB_URL:-postgres://vahak:vahak_password@db:5432/vahak?sslmode=disable}
       - DB_POOL_URL=${DB_POOL_URL:-postgres://vahak:vahak_password@db:5432/vahak?sslmode=disable}
+      - ACK_MODE=${ACK_MODE:-durable}
       - API_KEY=${API_KEY:-docker_test_key}
+      - ALLOW_INSECURE_DEFAULT_KEY=true
     depends_on:
       db:
         condition: service_healthy
