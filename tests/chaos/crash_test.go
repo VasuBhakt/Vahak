@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -103,7 +104,13 @@ func TestCrashRecovery_ZeroLoss(t *testing.T) {
 		return false
 	}
 
-	const totalIterations = 3
+	totalIterations := 3
+	if envVal := os.Getenv("CHAOS_ITERATIONS"); envVal != "" {
+		if n, err := strconv.Atoi(envVal); err == nil && n > 0 {
+			totalIterations = n
+		}
+	}
+	t.Logf("Running chaos crash recovery suite across %d iterations...", totalIterations)
 	var totalAckedAllIterations int64
 	var totalDuplicatesAllIterations int64
 

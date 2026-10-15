@@ -38,6 +38,8 @@ jobs:
         run: |
           go test -v -race ./internal/...
 
-      - name: Run Kill -9 Crash Recovery Proof Test
+      - name: Run Kill -9 Crash Recovery Chaos Verification
+        env:
+          CHAOS_ITERATIONS: 5
         run: |
           go test -v -timeout 180s ./tests/chaos/...
