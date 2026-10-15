@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -21,11 +22,25 @@ type SQLiteStore struct {
 }
 
 func NewSQLite(dbPath string) (*SQLiteStore, error) {
+	return NewSQLiteWithSync(dbPath, "")
+}
+
+func NewSQLiteWithSync(dbPath, syncMode string) (*SQLiteStore, error) {
 	if dbPath == "" {
 		dbPath = "vahak.db"
 	}
+	if syncMode == "" {
+		syncMode = os.Getenv("SQLITE_SYNCHRONOUS")
+	}
+	if syncMode == "" {
+		syncMode = "NORMAL"
+	}
+	syncMode = strings.ToUpper(syncMode)
+	if syncMode != "NORMAL" && syncMode != "FULL" && syncMode != "OFF" {
+		syncMode = "NORMAL"
+	}
 
-	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(10000)&_pragma=foreign_keys(ON)&_pragma=cache_size(-64000)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(268435456)", dbPath)
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(%s)&_pragma=wal_autocheckpoint(10000)&_pragma=foreign_keys(ON)&_pragma=cache_size(-64000)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(268435456)", dbPath, syncMode)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)

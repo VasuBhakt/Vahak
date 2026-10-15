@@ -62,13 +62,13 @@ func main() {
 
 	var st store.Storage
 	if cfg.DBEngine == "sqlite" {
-		sqliteStore, err := store.NewSQLite(cfg.DBPath)
+		sqliteStore, err := store.NewSQLiteWithSync(cfg.DBPath, cfg.SQLiteSynchronous)
 		if err != nil {
 			logger.Fatal("failed to init sqlite store", zap.Error(err))
 		}
 		defer sqliteStore.Close()
 		st = sqliteStore
-		logger.Info("connected to embedded SQLite database", zap.String("path", cfg.DBPath))
+		logger.Info("connected to embedded SQLite database", zap.String("path", cfg.DBPath), zap.String("synchronous", cfg.SQLiteSynchronous))
 	} else {
 		// init db pool
 		pool, err := store.NewPool(cfg.DBPoolUrl)

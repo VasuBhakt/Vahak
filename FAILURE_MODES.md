@@ -39,7 +39,7 @@ The table below details system behavior if the process terminates abruptly (`kil
 ### SQLite WAL Mode (`PRAGMA synchronous = NORMAL`)
 - **Process Crash (`kill -9`, SIGKILL, segfault, application crash):** Complete crash consistency. WAL frames committed prior to the 200 OK acknowledgment are preserved in the operating system buffer cache and flushed by the OS. Verified via automated chaos test (`TestCrashRecovery_ZeroLoss`).
 - **Physical Power Loss / OS Crash:** Under `synchronous = NORMAL`, SQLite syncs WAL frames to physical non-volatile storage during checkpoints rather than per-transaction. A sudden physical power loss (unplugging the machine) or operating system kernel panic can roll back transactions committed in the last checkpoint interval.
-- **Strict Power-Loss Requirement:** If physical power loss resilience is strictly required over throughput, configure `_pragma=synchronous(FULL)` or deploy Vahak with a replicated PostgreSQL cluster.
+- **Strict Power-Loss Requirement:** If physical power loss resilience is strictly required over throughput, configure `SQLITE_SYNCHRONOUS=FULL` or deploy Vahak with a replicated PostgreSQL cluster.
 
 ---
 

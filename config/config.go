@@ -19,6 +19,7 @@ type Config struct {
 	AllowLocalTargets bool
 	AllowInsecureKey  bool
 	RetentionDays     int
+	SQLiteSynchronous string // "NORMAL" (default) or "FULL"
 }
 
 func Load() *Config {
@@ -66,6 +67,11 @@ func Load() *Config {
 		dbPoolUrl = dbUrl
 	}
 
+	sqliteSync := os.Getenv("SQLITE_SYNCHRONOUS")
+	if sqliteSync == "" {
+		sqliteSync = "NORMAL"
+	}
+
 	return &Config{
 		AckMode:           ackMode,
 		DBEngine:          dbEngine,
@@ -77,5 +83,6 @@ func Load() *Config {
 		AllowLocalTargets: allowLocal,
 		AllowInsecureKey:  allowInsecureKey,
 		RetentionDays:     retentionDays,
+		SQLiteSynchronous: sqliteSync,
 	}
 }
