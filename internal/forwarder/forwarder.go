@@ -55,17 +55,21 @@ func New(store store.Storage, logger *zap.Logger, jq *queue.JobQueue, allowLocal
 			_, ipv6UniqueLocalNet, _ := net.ParseCIDR("fc00::/7")
 
 			for _, ip := range ips {
+				ipAddr := ip.IP
+				if v4 := ipAddr.To4(); v4 != nil {
+					ipAddr = v4
+				}
 				// Block loopback, private networks, cloud metadata (169.254.0.0/16), and link-local IPv6
 				if !allowLocal {
-					if ip.IP.IsPrivate() ||
-						ip.IP.IsLoopback() ||
-						ip.IP.IsUnspecified() ||
-						ip.IP.IsLinkLocalUnicast() ||
-						ip.IP.IsLinkLocalMulticast() ||
-						ip.IP.IsInterfaceLocalMulticast() ||
-						cloudMetadataNet.Contains(ip.IP) ||
-						ipv6LinkLocalNet.Contains(ip.IP) ||
-						ipv6UniqueLocalNet.Contains(ip.IP) {
+					if ipAddr.IsPrivate() ||
+						ipAddr.IsLoopback() ||
+						ipAddr.IsUnspecified() ||
+						ipAddr.IsLinkLocalUnicast() ||
+						ipAddr.IsLinkLocalMulticast() ||
+						ipAddr.IsInterfaceLocalMulticast() ||
+						cloudMetadataNet.Contains(ipAddr) ||
+						ipv6LinkLocalNet.Contains(ipAddr) ||
+						ipv6UniqueLocalNet.Contains(ipAddr) {
 						return nil, errors.New("SSRF blocked: private, loopback, or metadata/link-local IP address not allowed")
 					}
 				}
@@ -87,6 +91,9 @@ func New(store store.Storage, logger *zap.Logger, jq *queue.JobQueue, allowLocal
 		client: &http.Client{
 			Timeout:   10 * time.Second,
 			Transport: transport,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return errors.New("SSRF: redirects disabled for webhook delivery")
+			},
 		},
 	}
 }
