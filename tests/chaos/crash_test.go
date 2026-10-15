@@ -57,7 +57,6 @@ func TestCrashRecovery_ZeroLoss(t *testing.T) {
 		binName += ".exe"
 	}
 	binPath := filepath.Join(tmpDir, binName)
-	dbPath := filepath.Join(tmpDir, "crash_test.db")
 
 	t.Log("Building Vahak binary...")
 	buildCmd := exec.Command("go", "build", "-o", binPath, "../../cmd/server")
@@ -68,12 +67,12 @@ func TestCrashRecovery_ZeroLoss(t *testing.T) {
 	testPort := "8099"
 	testAPIKey := "chaos_test_secret_key"
 
-	startVahak := func() *exec.Cmd {
+	startVahak := func(currentPort, currentDBPath string) *exec.Cmd {
 		cmd := exec.Command(binPath)
 		cmd.Env = append(os.Environ(),
-			"PORT="+testPort,
+			"PORT="+currentPort,
 			"DB_ENGINE=sqlite",
-			"DB_PATH="+dbPath,
+			"DB_PATH="+currentDBPath,
 			"ACK_MODE=durable",
 			"API_KEY="+testAPIKey,
 			"ALLOW_LOCAL_TARGETS=true",
@@ -88,10 +87,10 @@ func TestCrashRecovery_ZeroLoss(t *testing.T) {
 		return cmd
 	}
 
-	waitForHealthy := func(timeout time.Duration) bool {
+	waitForHealthy := func(port string, timeout time.Duration) bool {
 		deadline := time.Now().Add(timeout)
 		for time.Now().Before(deadline) {
-			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%s/health", testPort))
+			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%s/health", port))
 			if err == nil && resp.StatusCode == http.StatusOK {
 				resp.Body.Close()
 				return true
@@ -104,139 +103,157 @@ func TestCrashRecovery_ZeroLoss(t *testing.T) {
 		return false
 	}
 
-	// 3. Start Vahak (Process 1)
-	t.Log("Starting initial Vahak process...")
-	proc1 := startVahak()
+	const totalIterations = 3
+	var totalAckedAllIterations int64
+	var totalDuplicatesAllIterations int64
 
-	if !waitForHealthy(10 * time.Second) {
-		proc1.Process.Kill()
-		t.Fatal("Vahak process 1 failed to become healthy")
-	}
+	for iter := 1; iter <= totalIterations; iter++ {
+		t.Logf("=== STARTING CHAOS RUN %d of %d ===", iter, totalIterations)
+		iterDBPath := filepath.Join(tmpDir, fmt.Sprintf("crash_test_iter_%d.db", iter))
 
-	// 4. Register an endpoint pointing to our test sink
-	createEpBody, _ := json.Marshal(map[string]string{
-		"name":       "chaos-endpoint",
-		"target_url": sink.URL,
-	})
-	req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%s/api/endpoints", testPort), bytes.NewBuffer(createEpBody))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-Key", testAPIKey)
+		// Start Vahak (Process 1)
+		proc1 := startVahak(testPort, iterDBPath)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusCreated {
-		proc1.Process.Kill()
-		t.Fatalf("failed to create endpoint: %v, status: %v", err, resp)
-	}
+		if !waitForHealthy(testPort, 10*time.Second) {
+			proc1.Process.Kill()
+			t.Fatalf("Iteration %d: Vahak process 1 failed to become healthy", iter)
+		}
 
-	var createdEp struct {
-		ID string `json:"id"`
-	}
-	json.NewDecoder(resp.Body).Decode(&createdEp)
-	resp.Body.Close()
-	epID := createdEp.ID
-	t.Logf("Created endpoint ID: %s pointing to sink: %s", epID, sink.URL)
+		// Register endpoint pointing to test sink
+		createEpBody, _ := json.Marshal(map[string]string{
+			"name":       fmt.Sprintf("chaos-endpoint-%d", iter),
+			"target_url": sink.URL,
+		})
+		req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%s/api/endpoints", testPort), bytes.NewBuffer(createEpBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", testAPIKey)
 
-	// 5. Send webhooks concurrently and track ACKed events
-	const totalEvents = 200
-	var ackedIDs sync.Map
-	var ackedCount int64
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			proc1.Process.Kill()
+			t.Fatalf("Iteration %d: failed to create endpoint: %v, status: %v", iter, err, resp)
+		}
 
-	var wg sync.WaitGroup
-	killOnce := sync.Once{}
+		var createdEp struct {
+			ID string `json:"id"`
+		}
+		json.NewDecoder(resp.Body).Decode(&createdEp)
+		resp.Body.Close()
+		epID := createdEp.ID
 
-	t.Logf("Firing %d webhooks and executing abrupt kill -9 mid-flight...", totalEvents)
+		// Send webhooks concurrently and randomly trigger kill -9
+		const totalEvents = 150
+		var ackedIDs sync.Map
+		var ackedCount int64
+		var wg sync.WaitGroup
+		killOnce := sync.Once{}
 
-	for i := 0; i < totalEvents; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
+		// Randomized kill threshold between 25 and 55 successful ACKs
+		killThreshold := int64(25 + (time.Now().UnixNano() % 30))
+		t.Logf("Iteration %d: Firing %d webhooks. Randomized kill threshold: %d ACKs...", iter, totalEvents, killThreshold)
 
-			eventID := uuid.New().String()
-			body, _ := json.Marshal(map[string]string{
-				"event_id": eventID,
-				"idx":      fmt.Sprintf("%d", idx),
+		for i := 0; i < totalEvents; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+
+				eventID := uuid.New().String()
+				body, _ := json.Marshal(map[string]string{
+					"event_id": eventID,
+					"idx":      fmt.Sprintf("%d", idx),
+				})
+
+				hookURL := fmt.Sprintf("http://127.0.0.1:%s/hooks/%s", testPort, epID)
+				postReq, _ := http.NewRequest("POST", hookURL, bytes.NewBuffer(body))
+				postReq.Header.Set("Content-Type", "application/json")
+
+				hookClient := &http.Client{Timeout: 3 * time.Second}
+				hookResp, hookErr := hookClient.Do(postReq)
+
+				if hookErr == nil && hookResp.StatusCode == http.StatusOK {
+					hookResp.Body.Close()
+					ackedIDs.Store(eventID, true)
+					currentAcked := atomic.AddInt64(&ackedCount, 1)
+
+					if currentAcked >= killThreshold {
+						killOnce.Do(func() {
+							t.Logf("Iteration %d: KILL -9 TRIGGERED at %d acknowledged requests", iter, currentAcked)
+							_ = proc1.Process.Kill()
+						})
+					}
+				} else if hookResp != nil {
+					hookResp.Body.Close()
+				}
+			}(i)
+
+			time.Sleep(4 * time.Millisecond)
+		}
+
+		wg.Wait()
+		proc1.Wait()
+
+		iterAcked := atomic.LoadInt64(&ackedCount)
+		t.Logf("Iteration %d: Process 1 terminated. Acknowledged: %d", iter, iterAcked)
+		if iterAcked == 0 {
+			t.Fatalf("Iteration %d: no requests acknowledged before kill", iter)
+		}
+		totalAckedAllIterations += iterAcked
+
+		// Restart Vahak (Process 2) with the SAME database
+		t.Logf("Iteration %d: Restarting Vahak (Process 2) to trigger recovery sweeper...", iter)
+		proc2 := startVahak(testPort, iterDBPath)
+
+		if !waitForHealthy(testPort, 10*time.Second) {
+			proc2.Process.Kill()
+			t.Fatalf("Iteration %d: Process 2 failed to become healthy on restart", iter)
+		}
+
+		// Wait for lease expiry and sweeper delivery of all acked requests
+		t.Logf("Iteration %d: Waiting for recovery sweeper...", iter)
+		deadline := time.Now().Add(25 * time.Second)
+		var missing []string
+
+		for time.Now().Before(deadline) {
+			missing = nil
+			ackedIDs.Range(func(key, value any) bool {
+				id := key.(string)
+				if _, received := receivedIDs.Load(id); !received {
+					missing = append(missing, id)
+				}
+				return true
 			})
 
-			hookURL := fmt.Sprintf("http://127.0.0.1:%s/hooks/%s", testPort, epID)
-			postReq, _ := http.NewRequest("POST", hookURL, bytes.NewBuffer(body))
-			postReq.Header.Set("Content-Type", "application/json")
-
-			hookClient := &http.Client{Timeout: 3 * time.Second}
-			hookResp, hookErr := hookClient.Do(postReq)
-
-			if hookErr == nil && hookResp.StatusCode == http.StatusOK {
-				hookResp.Body.Close()
-				ackedIDs.Store(eventID, true)
-				currentAcked := atomic.AddInt64(&ackedCount, 1)
-
-				// Kill the process abruptly mid-load after ~40-60 successful acks
-				if currentAcked >= 50 {
-					killOnce.Do(func() {
-						t.Logf("KILL -9 TRIGGERED: Abruptly terminating Vahak after %d acknowledged requests...", currentAcked)
-						if err := proc1.Process.Kill(); err != nil {
-							t.Logf("Process kill warning: %v", err)
-						}
-					})
-				}
-			} else if hookResp != nil {
-				hookResp.Body.Close()
+			if len(missing) == 0 {
+				break
 			}
-		}(i)
-
-		// Stagger requests slightly to ensure in-flight pipeline occupancy
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	// Wait for in-flight sender goroutines to finish (or error out after kill)
-	wg.Wait()
-	proc1.Wait() // ensure proc1 is completely terminated
-
-	totalAcked := atomic.LoadInt64(&ackedCount)
-	t.Logf("Vahak process 1 killed. Total requests that received 200 OK: %d", totalAcked)
-	if totalAcked == 0 {
-		t.Fatal("no requests were acknowledged before kill")
-	}
-
-	// 6. Restart Vahak with the SAME database (Process 2)
-	t.Log("Restarting Vahak (Process 2) to trigger recovery sweeper...")
-	proc2 := startVahak()
-	defer func() {
-		if proc2.Process != nil {
-			proc2.Process.Kill()
+			time.Sleep(200 * time.Millisecond)
 		}
-	}()
 
-	if !waitForHealthy(10 * time.Second) {
-		t.Fatal("Vahak process 2 failed to become healthy on restart")
-	}
+		proc2.Process.Kill()
+		proc2.Wait()
 
-	// 7. Wait for the recovery sweeper to deliver all acknowledged requests to the sink
-	t.Log("Waiting for recovery sweeper to deliver all acked requests...")
-	deadline := time.Now().Add(25 * time.Second)
-	var missing []string
+		if len(missing) > 0 {
+			t.Fatalf("Iteration %d: DATA LOSS DETECTED: %d / %d acknowledged events lost after kill -9!\nMissing IDs: %v",
+				iter, len(missing), iterAcked, missing)
+		}
 
-	for time.Now().Before(deadline) {
-		missing = nil
-		ackedIDs.Range(func(key, value any) bool {
-			id := key.(string)
-			if _, received := receivedIDs.Load(id); !received {
-				missing = append(missing, id)
-			}
+		// Calculate duplicates for this iteration
+		currentTotalReceived := atomic.LoadInt64(&receivedCount)
+		var uniqueReceivedCount int64
+		receivedIDs.Range(func(_, _ any) bool {
+			uniqueReceivedCount++
 			return true
 		})
+		iterDuplicates := currentTotalReceived - uniqueReceivedCount
+		totalDuplicatesAllIterations = iterDuplicates
 
-		if len(missing) == 0 {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
+		t.Logf("Iteration %d SUCCESS: All %d acknowledged events durably delivered. (Cumulative duplicates: %d)",
+			iter, iterAcked, iterDuplicates)
 	}
 
-	// 8. Assert: Provably zero acknowledged events lost
-	if len(missing) > 0 {
-		t.Fatalf("PROVABLE DATA LOSS DETECTED: %d / %d acknowledged events were lost after kill -9!\nMissing IDs: %v",
-			len(missing), totalAcked, missing)
-	}
-
-	t.Logf("SUCCESS: All %d acknowledged events were durably recovered and delivered to the sink after kill -9!", totalAcked)
+	t.Logf("================================================================================")
+	t.Logf("CHAOS TEST COMPLETE: Verified ZERO acknowledged-event loss across %d randomized kill -9 runs.", totalIterations)
+	t.Logf("Total acknowledged requests recovered: %d | Total benign duplicates: %d", totalAckedAllIterations, totalDuplicatesAllIterations)
+	t.Logf("================================================================================")
 }
