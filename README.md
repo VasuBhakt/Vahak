@@ -1,6 +1,6 @@
 # 🦅 Vahak
 
-Vahak is a durable, single-node webhook ingestion and delivery engine written in Go. It provides crash-tested at-least-once delivery for acknowledged events across process crashes (`kill -9`), featuring dual-engine storage (embedded SQLite WAL or PostgreSQL), in-process JavaScript transformations, and adaptive circuit breaking without external message brokers.
+Vahak is a durable webhook ingestion and delivery engine written in Go, compiled as a **single static binary** (`CGO_ENABLED=0`). It provides crash-tested at-least-once delivery across process crashes (`kill -9`) without external message brokers (no Redis, Kafka, or RabbitMQ). Persistence is handled via an embedded pure-Go SQLite engine (WAL mode) or PostgreSQL 16, and the administrative React UI is compiled directly into the binary via `go:embed`.
 
 ---
 
@@ -130,7 +130,19 @@ Runs both Vahak and tuned PostgreSQL 16 containers in an isolated internal Docke
 ## 🧪 Benchmarking & Verification
 
 ### In-Container Benchmark (Docker Network)
-Benchmark from inside the Docker bridge network to measure pure daemon throughput without host network proxy limits:
+
+#### 1. Create a Target Endpoint
+Create a benchmark endpoint pointing to the local mock sink (`http://sink:9090`) to obtain an `ENDPOINT_UUID`:
+```bash
+curl -s -X POST http://localhost:8080/api/endpoints \
+  -H "X-API-Key: docker_test_key" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"bench","target_url":"http://sink:9090"}'
+```
+*Example response:* `{"id":"b1c2d3e4-5678-90ab-cdef-1234567890ab", ...}`
+
+#### 2. Run In-Network Load Test
+Benchmark from inside the Docker bridge network (`vahak_default`) to measure pure daemon throughput without host network proxy limits (substitute the returned `id`):
 ```bash
 docker run --rm --network vahak_default williamyeh/hey \
   -n 15000 -c 200 -m POST \
@@ -148,7 +160,7 @@ Evaluated with `hey` (-n 15000, 200 concurrent connections) across the supported
 | Mode | Engine & Execution Environment | Measured Throughput | Avg Latency | P99 Latency | Durability Guarantee |
 |---|---|---|---|---|---|
 | **`ACK_MODE=durable`** (Default) | Embedded SQLite (WAL) — Host Native (Windows NVMe) | **2,200 – 3,400 RPS** | 58.0 – 85.0 ms | 190.0 – 480.0 ms | **Crash-Tested Zero Loss:** Process-crash safe; committed to WAL before 200 OK (uncheckpointed frames subject to OS power loss without `SQLITE_SYNCHRONOUS=FULL`) |
-| **`ACK_MODE=durable`** | PostgreSQL 16 — Internal Docker Network (`db:5432`) | **8,500 – 10,200 RPS** | 42.0 – 58.0 ms | 168.0 ms | **Crash-Tested Zero Loss:** `CopyFrom` committed before 200 OK |
+| **`ACK_MODE=durable`** | PostgreSQL 16 — Internal Docker Network (`db:5432`) | **3,500 – 5,000 RPS** | 39.6 – 58.0 ms | 190.0 – 340.0 ms | **Crash-Tested Zero Loss:** `CopyFrom` committed before 200 OK |
 | **`ACK_MODE=fast`** (Opt-in) | Embedded SQLite (WAL) — Host Native (Windows NVMe) | **40,000 – 55,000 RPS** | 3.2 – 4.5 ms | 23.0 – 35.0 ms | **In-Memory ACK:** Channel enqueue before commit |
 
 ---
