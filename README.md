@@ -1,6 +1,6 @@
 # 🦅 Vahak
 
-Vahak is a durable, single-node webhook ingestion and delivery engine written in Go. It provably guarantees at-least-once delivery for acknowledged events across process crashes (`kill -9`), featuring dual-engine storage (embedded SQLite WAL or PostgreSQL), in-process JavaScript transformations, and adaptive circuit breaking without external message brokers.
+Vahak is a durable, single-node webhook ingestion and delivery engine written in Go. It provides crash-tested at-least-once delivery for acknowledged events across process crashes (`kill -9`), featuring dual-engine storage (embedded SQLite WAL or PostgreSQL), in-process JavaScript transformations, and adaptive circuit breaking without external message brokers.
 
 ---
 
@@ -33,18 +33,20 @@ Vahak is a durable, single-node webhook ingestion and delivery engine written in
                            (status = 'delivered')                  │
                                                                    ▼
                                                             [ Recovery Sweeper ]
-                                                            (Runs on startup + 30s ticker)
+                                                            (Runs on startup + 2s ticker, leased drain loop)
 ```
 
 ### 1. Ingestion & Acknowledgment Modes
 Vahak supports two acknowledgment modes via `ACK_MODE`:
-- **`ACK_MODE=durable` (Default, Production Recommended):** The HTTP handler enqueues to the batcher, blocks until the atomic batch transaction commits to durable storage, and only then acknowledges `200 OK` to the sender and dispatches to the delivery worker pool. Guarantees **zero acknowledged-event loss** across abrupt process crashes (`kill -9`).
+- **`ACK_MODE=durable` (Default, Recommended):** The HTTP handler enqueues to the batcher, blocks until the atomic batch transaction commits to durable storage, and only then acknowledges `200 OK` to the sender and dispatches to the delivery worker pool. Guarantees **zero acknowledged-event loss** across abrupt process crashes (`kill -9`).
 - **`ACK_MODE=fast` (Opt-in):** Returns `200 OK` immediately upon channel enqueue (<0.5ms). Dispatches delivery concurrently with background batch writing. Designed for high-volume non-critical telemetry where in-memory loss across an abrupt process kill is acceptable.
 
 ### 2. At-Least-Once Delivery Mechanics
-- **Pre-Dispatch Commitment:** Before an event is dispatched to downstream targets, both the payload (`requests`) and its queue entry (`delivery_jobs`, `status = 'pending'`) are committed to storage.
+- **Pre-Dispatch Commitment:** Before an event is dispatched to downstream targets, both the payload (`requests`) and its queue entry (`delivery_jobs`, `status = 'pending'`) are committed to storage atomically.
 - **Delivery Confirmation:** Successful deliveries push the job ID to `deliveredCh`, where a status worker periodically updates `delivery_jobs SET status = 'delivered' WHERE id IN (...)` to minimize transaction lock frequency.
-- **Recovery Sweeper:** On startup and every 30 seconds thereafter, a background sweeper queries `delivery_jobs WHERE status = 'pending' AND next_attempt <= NOW() LIMIT 100` using a partial index. Any webhook in-flight during a crash is automatically recovered and re-delivered upon restart.
+- **Recovery Sweeper & Leased Drain Loop:** On startup and every 2 seconds thereafter, a background sweeper claims pending/expired jobs in batches of 100 using atomic worker leases (`ClaimPendingJobs` with a 15-second lease). It continuously loops until the backlog is fully drained. Any webhook in-flight during an abrupt crash is safely recovered after lease expiry and re-delivered upon restart.
+- **Terminal State Machine:** Deliveries that encounter repeated failures are retried with exponential backoff up to 5 attempts (`MaxAttempts = 5`). Upon exhausting retries, the job transitions to a terminal `failed` state.
+- **Retention Protection Invariant:** Storage retention pruning (`PruneExpired`) runs hourly to enforce `RETENTION_DAYS`, but strictly protects uncompleted deliveries via `WHERE NOT EXISTS (SELECT 1 FROM delivery_jobs j WHERE j.request_id = requests.id AND j.status NOT IN ('delivered', 'failed', 'dead'))`. Webhooks destined for temporarily offline targets are never pruned until completed or retry exhaustion.
 - For complete failure mode specifications, see [FAILURE_MODES.md](FAILURE_MODES.md).
 
 ### 3. Graceful Drain Lifecycle
@@ -64,7 +66,7 @@ Vahak abstracts persistence behind a unified Go interface (`store.Storage`), con
 |---|---|---|
 | **Driver** | `modernc.org/sqlite` (Pure Go, `CGO_ENABLED=0`) | `jackc/pgx/v5` (`pgxpool`, `max_conns=200`) |
 | **Concurrency Model** | Multi-reader, single-writer (WAL mode) | Multi-connection pool with simple query protocol |
-| **Durability Pragma** | `PRAGMA synchronous(NORMAL)` | PostgreSQL WAL defaults |
+| **Durability Pragma** | `PRAGMA synchronous(NORMAL)` (or `FULL` via `SQLITE_SYNCHRONOUS`) | PostgreSQL WAL defaults |
 | **Write Protocol** | Multi-row batch parameterization | Multi-row batching / `COPY` protocol |
 | **Data Retention** | Automated hourly pruning via `RETENTION_DAYS` | Automated hourly pruning via `RETENTION_DAYS` |
 
@@ -79,13 +81,13 @@ PRAGMA cache_size = -64000;       -- 64MB memory cache
 PRAGMA temp_store = MEMORY;
 PRAGMA mmap_size = 268435456;     -- 256MB memory-mapped I/O
 ```
-> **Note on `synchronous=NORMAL`:** Under SQLite WAL mode, `NORMAL` guarantees zero database corruption and zero data loss on application crash (`kill -9`, SIGKILL, segfault, OS panic). In the event of catastrophic physical power loss (unplugging hardware), recent un-checkpointed WAL frames can be lost. See [FAILURE_MODES.md](FAILURE_MODES.md) for details.
+> **Note on `synchronous=NORMAL`:** Under SQLite WAL mode, `NORMAL` guarantees zero database corruption and zero data loss across process crashes (`kill -9`, SIGKILL, segfault, application panic). In the event of catastrophic physical power loss (unplugging hardware) or an operating system kernel crash, uncheckpointed WAL frames in the OS page cache can be lost. If physical power-loss protection is strictly required, set `SQLITE_SYNCHRONOUS=FULL`. See [FAILURE_MODES.md](FAILURE_MODES.md) for details.
 
 ---
 
 ## 🚀 Deployment & Operational Modes
 
-Vahak is designed around two primary, battle-tested operational patterns:
+Vahak is designed around two primary operational patterns:
 
 ### Mode 1: Pure Local (Zero-Dependency SQLite)
 *Best for: Local development, CI testing, edge gateways, single-node deployments.*
@@ -125,15 +127,6 @@ Runs both Vahak and tuned PostgreSQL 16 containers in an isolated internal Docke
 
 ---
 
-### ⚡ Data Plane Optimizations
-To achieve 10k–30k RPS with sustained stability, Vahak incorporates the following low-level engineering optimizations:
-- **Zero-Contention Data Path:** Chi `middleware.Logger` is strictly scoped to `/api/*` management routes. High-volume `/hooks/*` endpoints bypass synchronous OS console mutexes (`stdout`).
-- **HTTP Transport Keep-Alive Recycling:** Outbound delivery bodies are drained via `io.Copy(io.Discard, resp.Body)` and closed immediately, allowing Go's `http.Transport` connection pool to recycle TCP sockets without exhausting OS ephemeral ports (`connectex`).
-- **Zero-Allocation Channel Timers:** Eliminated per-request `time.After()` heap allocations in webhook capture by utilizing direct non-blocking select sends with reusable fallback timers.
-- **Failure-Only Queueing in Fast Mode:** When `ACK_MODE=fast`, successful deliveries complete in-memory without touching disk; only failed attempts are written to `delivery_jobs` for exponential retry.
-
----
-
 ## 🧪 Benchmarking & Verification
 
 ### In-Container Benchmark (Docker Network)
@@ -150,40 +143,41 @@ docker run --rm --network vahak_default williamyeh/hey \
 
 ## 📊 Measured Benchmarks
 
-Benchmarks were performed locally on an 8-core machine using `hey` with **15,000 requests** at **200 concurrent connections**:
+Evaluated with `hey` (-n 15000, 200 concurrent connections) across the supported deployment targets:
 
-| Test Mode | Persistence Engine | Measured Throughput | Avg Latency | P99 Latency | Durability Guarantee |
+| Mode | Engine & Execution Environment | Measured Throughput | Avg Latency | P99 Latency | Durability Guarantee |
 |---|---|---|---|---|---|
-| **`ACK_MODE=durable`** (Default) | Embedded SQLite (WAL) | **4,150 – 4,820 RPS** | 42.0 ms | 192.8 ms | **Provable Zero Loss:** Committed to disk before 200 OK |
-| **`ACK_MODE=fast`** (Opt-in) | Embedded SQLite (WAL) | **20,000 – 31,500 RPS** | 5.4 – 7.8 ms | 49.3 ms | **In-Memory ACK:** Channel enqueue before disk commit |
-| **`ACK_MODE=durable`** | PostgreSQL 16 (Docker) | **7,500 – 11,650 RPS** | 39.5 – 66.0 ms | 173.0 ms | **Provable Zero Loss:** `CopyFrom` committed before 200 OK |
+| **`ACK_MODE=durable`** (Default) | Embedded SQLite (WAL) — Host Native (Windows NVMe) | **2,200 – 3,400 RPS** | 58.0 – 85.0 ms | 190.0 – 480.0 ms | **Crash-Tested Zero Loss:** Process-crash safe; committed to WAL before 200 OK (uncheckpointed frames subject to OS power loss without `SQLITE_SYNCHRONOUS=FULL`) |
+| **`ACK_MODE=durable`** | PostgreSQL 16 — Internal Docker Network (`db:5432`) | **8,500 – 10,200 RPS** | 42.0 – 58.0 ms | 168.0 ms | **Crash-Tested Zero Loss:** `CopyFrom` committed before 200 OK |
+| **`ACK_MODE=fast`** (Opt-in) | Embedded SQLite (WAL) — Host Native (Windows NVMe) | **40,000 – 55,000 RPS** | 3.2 – 4.5 ms | 23.0 – 35.0 ms | **In-Memory ACK:** Channel enqueue before commit |
 
 ---
 
-## 💥 Chaos Crash Recovery Proof Test (`kill -9`)
+## 💥 Chaos Crash Recovery Verification (`kill -9`)
 
-Vahak includes an automated chaos test ([`tests/chaos/crash_test.go`](tests/chaos/crash_test.go)) executed on every CI build:
+Vahak includes an automated chaos test suite ([`tests/chaos/crash_test.go`](tests/chaos/crash_test.go)) executed on every CI build:
 
-1. Spawns an HTTP sink recording unique event IDs.
-2. Starts Vahak in `ACK_MODE=durable` and floods concurrent webhooks.
-3. Mid-load, abruptly executes `kill -9` (`SIGKILL`) on the Vahak process.
-4. Restarts Vahak with the same database.
-5. Asserts that **100% of acknowledged requests** (`200 OK`) are recovered by the startup sweeper and delivered to the sink at least once.
+1. Starts an HTTP sink recording unique event IDs (`X-Vahak-Event-ID`).
+2. Boots Vahak in `ACK_MODE=durable` and floods concurrent webhooks.
+3. Mid-load, abruptly executes `kill -9` (`SIGKILL`) on the Vahak process at a **randomized threshold**.
+4. Restarts Vahak with the same database, allowing atomic worker leases to expire.
+5. Verifies that **100% of acknowledged requests** (`200 OK`) are recovered by the startup sweeper and delivered to the sink at least once.
+6. Repeats across multiple randomized crash-recovery iterations and logs cumulative duplicate delivery metrics (configurable via `CHAOS_ITERATIONS`).
 
 ```bash
-# Run the kill -9 chaos test locally
-go test -v -timeout 120s ./tests/chaos/...
+# Run the multi-iteration kill -9 chaos test locally
+go test -v -timeout 180s ./tests/chaos/...
 ```
 
 ---
 
 ## 🛡️ Security & Fault Tolerance
 
-- **SSRF Mitigation:** Custom transport resolves DNS and blocks private subnets (RFC 1918), loopback, link-local / cloud instance metadata (`169.254.0.0/16`), and IPv6 link-local/multicast ranges (`fe80::/10`, `fc00::/7`). Permitted only when `ALLOW_LOCAL_TARGETS=true`.
+- **SSRF Mitigation:** Custom dialer performs DNS resolution at dial time and blocks private subnets (RFC 1918), loopback, cloud instance metadata (`169.254.0.0/16`), and IPv6 link-local/unique-local ranges (`fe80::/10`, `fc00::/7`). IPv4-mapped IPv6 addresses are normalized before validation, and HTTP redirects are strictly disabled to prevent SSRF redirect-hopping. Permitted only when `ALLOW_LOCAL_TARGETS=true`.
 - **API Key Startup Enforcement:** Refuses to boot if `API_KEY` is empty or set to the default `docker_test_key` without explicit `ALLOW_INSECURE_DEFAULT_KEY=true`.
 - **CPU Starvation Protection:** User-defined JavaScript transformations running in the embedded `goja` runtime are wrapped with a `time.AfterFunc` watchdog terminating execution after 50ms to prevent infinite loops (`while(true)`).
 - **Circuit Breaker State Machine:** Per-host failure tracking. 5 consecutive delivery failures trip the circuit into `Open` state. Requests during cooldown are rescheduled to `delivery_jobs` with exponential backoff without firing outbound network calls.
-- **Bounded Retention:** Background worker executes hourly pruning of records where `received_at < NOW() - INTERVAL 'RETENTION_DAYS'` to enforce fixed storage ceilings.
+- **Bounded Retention:** Background worker executes hourly pruning of records where `received_at < NOW() - INTERVAL 'RETENTION_DAYS'`, with an explicit invariant protecting pending/retrying jobs from deletion during prolonged downstream outages.
 
 ---
 
@@ -195,6 +189,7 @@ go test -v -timeout 120s ./tests/chaos/...
 | `ACK_MODE` | Ingestion acknowledgment mode: `durable` or `fast` | `durable` |
 | `DB_ENGINE` | Storage driver: `sqlite` or `postgres` | `sqlite` |
 | `DB_PATH` | Path to SQLite file (when `DB_ENGINE=sqlite`) | `vahak.db` |
+| `SQLITE_SYNCHRONOUS` | SQLite sync pragma: `NORMAL` (process-crash safe) or `FULL` (power-loss safe) | `NORMAL` |
 | `DB_URL` | PostgreSQL connection string | `""` |
 | `DB_POOL_URL` | PostgreSQL connection pool URL (falls back to `DB_URL`) | `""` |
 | `API_KEY` | Secret token for administrative `/api/*` endpoints (Required) | `""` |
@@ -214,7 +209,7 @@ go test -v ./...
 go test -race ./...
 
 # Chaos crash recovery verification
-go test -v -timeout 120s ./tests/chaos/...
+go test -v -timeout 180s ./tests/chaos/...
 ```
 
 ---

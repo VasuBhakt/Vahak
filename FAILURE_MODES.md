@@ -37,10 +37,43 @@ The table below details system behavior if the process terminates abruptly (`kil
 ## 3. Storage Durability Boundaries
 
 ### SQLite WAL Mode (`PRAGMA synchronous = NORMAL`)
-- **Process Crash / `kill -9` / OS Panic:** Complete crash consistency. WAL frames committed prior to the ACK are preserved. Verified via automated chaos test (`TestCrashRecovery_ZeroLoss`).
-- **Physical Power Loss (Unplugging Power):** Under `synchronous = NORMAL`, SQLite syncs WAL frames to disk during checkpoints rather than per-transaction. A sudden physical power failure or hardware reset can roll back transactions committed in the last checkpoint interval (~few hundred milliseconds).
-- **Strict Power-Loss Requirement:** If physical power loss resilience is strictly required over throughput, configure `_pragma=synchronous(FULL)` or use an external replicated PostgreSQL cluster.
+- **Process Crash (`kill -9`, SIGKILL, segfault, application crash):** Complete crash consistency. WAL frames committed prior to the 200 OK acknowledgment are preserved in the operating system buffer cache and flushed by the OS. Verified via automated chaos test (`TestCrashRecovery_ZeroLoss`).
+- **Physical Power Loss / OS Crash:** Under `synchronous = NORMAL`, SQLite syncs WAL frames to physical non-volatile storage during checkpoints rather than per-transaction. A sudden physical power loss (unplugging the machine) or operating system kernel panic can roll back transactions committed in the last checkpoint interval.
+- **Strict Power-Loss Requirement:** If physical power loss resilience is strictly required over throughput, configure `_pragma=synchronous(FULL)` or deploy Vahak with a replicated PostgreSQL cluster.
 
-### Acknowledgment Modes (`ACK_MODE`)
-- **`ACK_MODE=durable` (Default):** The HTTP handler blocks until the multi-row batch is committed to disk before sending HTTP 200 OK. Guarantees zero acknowledged-event loss across process crashes.
-- **`ACK_MODE=fast` (Opt-in):** The HTTP handler sends HTTP 200 OK immediately upon channel enqueue (<0.5ms). Provides microsecond ingress latency for telemetry workloads where process-death memory loss is an acceptable trade-off.
+---
+
+## 4. Duplicate Delivery Sources & Idempotency
+
+Because Vahak enforces **at-least-once delivery**, duplicate deliveries can occur under two specific failure conditions:
+
+1. **Crash Between Delivery and Status Flush:** The worker successfully transmits the webhook and receives a `200 OK` from the destination target, but the Vahak process terminates (`kill -9`) before the batched `status = 'delivered'` commit completes. Upon restart, the sweeper detects the job as `pending` and redelivers it.
+2. **Lease Expiry on a Slow Target:** If an upstream destination hangs or takes longer to respond than the atomic worker lease (15 seconds), the sweeper will consider the delivery abandoned and re-claim the job for concurrent dispatch.
+
+### Deduplication Contract
+Every outbound webhook transmitted by Vahak includes standardized tracking headers:
+- `X-Vahak-Event-ID`: The immutable UUID of the original captured webhook. This ID remains identical across all retries and redeliveries.
+- `X-Vahak-Delivery-ID`: A unique UUID generated per individual HTTP attempt.
+- `X-Vahak-Timestamp`: RFC3339 timestamp of the delivery dispatch.
+
+> **Target Implementation:** Receivers should maintain an idempotency cache of recently processed `X-Vahak-Event-ID` values to discard duplicate deliveries safely.
+
+---
+
+## 5. Terminal States & Retention Invariants
+
+- **Retry Schedule:** Jobs undergo exponential backoff with full randomized jitter across up to 5 attempts (`MaxAttempts = 5`), with backoff capping at 30 minutes.
+- **Terminal States:** A delivery job reaches a terminal state when:
+  1. The target responds with a `2xx` status code (`status = 'delivered'`).
+  2. All 5 retry attempts are exhausted without success (`status = 'failed'`).
+- **Retention Invariant:** The hourly retention cleaner (`RETENTION_DAYS`, default 7) executes:
+  ```sql
+  DELETE FROM requests 
+  WHERE received_at < cutoff
+    AND NOT EXISTS (
+      SELECT 1 FROM delivery_jobs j 
+      WHERE j.request_id = requests.id 
+        AND j.status NOT IN ('delivered', 'failed', 'dead')
+    );
+  ```
+  Even during prolonged downstream outages exceeding the retention window, **pending jobs are never cascaded away or deleted** until they have reached a terminal state.
